@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video NAS Tools</title>
+<link rel="stylesheet" href="/static/style.css?v=20261127d">
+</head>
+<body>
+<header>
+  <div class="logo">🎬 Video NAS Tools</div>
+  <div class="root-setting">
+    <input id="rootInput" placeholder="NAS 视频根目录，如 D:\videos" spellcheck="false">
+    <button id="pickBtn" class="btn" title="打开系统目录选择对话框">📂 浏览</button>
+    <button id="rootSaveBtn" class="btn">保存</button>
+  </div>
+</header>
+
+<main>
+  <aside id="sidebar">
+    <div class="sidebar-head">
+      <div class="sidebar-tools">
+        <button id="previewToggleBtn" class="btn ghost sm" title="显示/隐藏视频预览">🎬 隐藏预览</button>
+      </div>
+      <div id="dirList" class="dir-list"></div>
+      <div class="file-toolbar">
+        <div class="view-switch" title="查看方式">
+          <button id="viewListBtn" class="view-btn active" title="名称列表">☰</button>
+          <button id="viewGridBtn" class="view-btn" title="缩略图">▦</button>
+        </div>
+        <select id="sortSelect" class="sort-select" title="排序方式">
+          <option value="name-asc">名称 ↑</option>
+          <option value="name-desc">名称 ↓</option>
+          <option value="time-desc">最新修改</option>
+          <option value="time-asc">最早修改</option>
+          <option value="size-desc">最大优先</option>
+          <option value="size-asc">最小优先</option>
+        </select>
+        <span id="fileCount" class="file-count">文件 0</span>
+        <button id="clearCheckBtn" class="btn ghost sm" title="取消当前所有勾选">☒ 取消勾选</button>
+        <button id="selectAllBtn" class="btn ghost sm" title="勾选/取消勾选全部视频文件">☑ 全选</button>
+      </div>
+    </div>
+    <div id="fileList" class="file-list"></div>
+  </aside>
+
+  <div id="splitter" class="splitter" title="拖拽调整左右比例"></div>
+
+  <section id="workspace">
+    <div id="emptyState" class="empty-state">
+      <div class="empty-icon">🎞️</div>
+      <p>从左侧选择一个视频文件开始预览</p>
+      <p class="hint">勾选文件即可批量截取 / 旋转 / 删除</p>
+    </div>
+
+    <div id="previewArea" hidden>
+      <div class="preview-head">
+        <span id="previewTitle" class="preview-title">🎬 视频预览</span>
+      </div>
+      <div class="preview-body">
+        <video id="player" controls preload="metadata"></video>
+        <div id="metaInfo" class="meta-info"></div>
+      </div>
+    </div>
+
+    <div id="selectedPanel" class="tab-panel" hidden>
+      <div id="previewHint" class="preview-hint">💡 点击左侧文件名可预览，用「设为当前」标记截取时间点</div>
+
+      <div class="op-tabs" id="opTabs">
+        <button class="op-tab active" data-op="cut">✂️ 截取</button>
+        <button class="op-tab" data-op="rotate">🔄 旋转</button>
+        <button class="op-tab" data-op="delete">🗑️ 删除</button>
+        <button class="op-tab" data-op="rename">📝 重命名</button>
+        <button class="op-tab" data-op="concat">🔗 拼接</button>
+      </div>
+
+      <div class="op-pane" id="opCard-cut" data-op-card="cut">
+        <div class="time-row">
+          <label>起点
+            <input id="batchStart" type="text" placeholder="mm:ss">
+            <button class="btn ghost sm" data-mark="batchStart">设为当前</button>
+          </label>
+          <label>终点
+            <input id="batchEnd" type="text" placeholder="mm:ss">
+            <button class="btn ghost sm" data-mark="batchEnd">设为当前</button>
+          </label>
+        </div>
+        <div class="opt-row">
+          <label class="radio"><input type="radio" name="batchCutMode" value="lossless" checked>
+            无损（关键帧对齐，秒级）</label>
+          <label class="radio"><input type="radio" name="batchCutMode" value="transcode">
+            精确（重新编码，逐帧准）</label>
+        </div>
+        <div class="op-actions">
+          <button id="playRangeBtn" class="btn ghost sm">▶ 预览片段</button>
+          <button id="batchCutBtn" class="btn primary">✂️ 截取</button>
+        </div>
+      </div>
+
+      <div class="op-pane" id="opCard-rotate" data-op-card="rotate" hidden>
+        <div class="degree-group">
+          <button class="btn ghost deg active" data-bdeg="90">90° ↻</button>
+          <button class="btn ghost deg" data-bdeg="180">180° ↕</button>
+          <button class="btn ghost deg" data-bdeg="270">270° ↺</button>
+        </div>
+        <div class="opt-row">
+          <label class="radio"><input type="radio" name="batchRotMode" value="lossless" checked>
+            快速（仅写旋转元数据）</label>
+          <label class="radio"><input type="radio" name="batchRotMode" value="transcode">
+            实际旋转（重新编码像素）</label>
+        </div>
+        <div class="op-actions">
+          <button id="batchRotateBtn" class="btn primary">🔄 旋转</button>
+        </div>
+      </div>
+
+      <div class="op-pane" id="opCard-delete" data-op-card="delete" hidden>
+        <p class="warn-text">本地磁盘文件移入回收站，可恢复；网络位置（NAS/UNC 路径）可能被直接删除，请谨慎操作。</p>
+        <div class="op-actions">
+          <button id="batchDeleteBtn" class="btn danger">🗑️ 删除</button>
+        </div>
+      </div>
+
+      <div class="op-pane" id="opCard-rename" data-op-card="rename" hidden>
+        <div class="opt-row">
+          <label class="radio"><input type="radio" name="renameBaseMode" value="first" checked>
+            用第一个文件名 + 序号</label>
+          <label class="radio"><input type="radio" name="renameBaseMode" value="custom">
+            自定义基础名 + 序号</label>
+        </div>
+        <div class="rename-row">
+          <input id="renameBase" type="text" placeholder="自定义基础文件名" disabled>
+          <label>起始 <input id="renameStart" type="number" min="0" value="1"></label>
+          <label>补零
+            <select id="renameDigits">
+              <option value="0">不补零</option>
+              <option value="2">01 / 02</option>
+              <option value="3">001 / 002</option>
+            </select>
+          </label>
+        </div>
+        <div id="renamePreview" class="rename-preview"></div>
+        <div class="op-actions">
+          <button id="batchRenameBtn" class="btn primary">📝 重命名</button>
+        </div>
+      </div>
+
+      <div class="op-pane" id="opCard-concat" data-op-card="concat" hidden>
+        <div class="concat-hint">按列表顺序拼接，拖拽行可调整顺序；原视频保留不变。</div>
+        <div id="concatList" class="concat-list"></div>
+        <div class="concat-actions">
+          <button id="concatClearOrderBtn" class="btn ghost sm" title="按当前勾选顺序重置排序">↺ 重置顺序</button>
+        </div>
+        <div class="opt-row">
+          <label class="radio"><input type="radio" name="concatMode" value="copy" checked>
+            无损拼接（需编码一致）</label>
+          <label class="radio"><input type="radio" name="concatMode" value="reencode">
+            兼容拼接（重新编码）</label>
+        </div>
+        <div class="op-actions">
+          <button id="batchConcatBtn" class="btn primary">🔗 拼接</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<button id="taskFab" class="task-fab" title="展开任务队列">
+  ⚙️<span id="fabBadge" class="fab-badge" hidden></span>
+</button>
+
+<div id="taskPanel" class="task-panel" hidden>
+  <div class="task-panel-header">
+    <span>⚙️ 任务队列</span><span id="taskSummary"></span>
+    <button id="clearTasksBtn" class="btn ghost sm" title="清除已完成/失败的任务记录">清除</button>
+    <span id="collapseTasksBtn" class="collapse-btn" title="收起任务队列">▾</span>
+  </div>
+  <div id="taskList"></div>
+</div>
+
+<div id="toast" class="toast"></div>
+<script src="/static/app.js?v=20261127c"></script>
+</body>
+</html>

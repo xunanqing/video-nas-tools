@@ -1,0 +1,19 @@
+# 本地配置与测试数据
+settings.json
+videos/
+.testdata/
+
+# 缩略图缓存
+.thumbnails/
+
+# 工作记录与本地数据
+.workbuddy/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.log
+
+# 虚拟环境
+.venv/
+venv/
