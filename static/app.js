@@ -396,6 +396,9 @@ async function selectFile(path, force = false) {
     fmtSize(info.size || f.size),
   ].filter(Boolean);
   $("metaInfo").innerHTML = bits.map((b) => `<span>${b}</span>`).join("");
+  // 当前处于检测/元数据面板时，切换文件后同步加载对应数据
+  if (currentOp() === "detect") loadDetectResult();
+  if (currentOp() === "meta") loadMetadata();
 }
 
 /* ---------- 截取 / 旋转（统一按勾选文件批量执行） ---------- */
@@ -557,6 +560,204 @@ async function doConcat() {
   } catch (e) { toast("拼接失败: " + e.message, true); }
 }
 
+/* ---------- 智能检测 ---------- */
+
+function currentOp() {
+  return document.querySelector(".op-tab.active")?.dataset.op || "";
+}
+
+function timeLabel(t) {
+  const m = Math.floor(t / 60);
+  const s = t % 60;
+  return `${m}:${s.toFixed(2).padStart(5, "0")}`;
+}
+
+async function loadDetectResult() {
+  const f = state.selectedFile;
+  const box = $("detectResult");
+  if (!f) {
+    box.innerHTML = '<div class="detect-empty">请先预览一个视频</div>';
+    $("detectStatus").textContent = "";
+    return;
+  }
+  try {
+    const r = await api("/api/detect?path=" + encodeURIComponent(f.path));
+    if (r.status === "done") {
+      renderDetectResult(r.result);
+      $("detectStatus").textContent = "检测结果已就绪";
+    } else {
+      box.innerHTML = '<div class="detect-empty">尚未检测，点击「开始检测」分析当前视频</div>';
+      $("detectStatus").textContent = "";
+    }
+  } catch (e) {
+    box.innerHTML = '<div class="detect-empty">读取检测结果失败</div>';
+    $("detectStatus").textContent = "";
+  }
+}
+
+function renderDetectResult(result) {
+  const box = $("detectResult");
+  if (!result) { box.innerHTML = ""; return; }
+  const parts = [];
+  const groups = [["black", "黑帧区间", false], ["silence", "静音区间", false],
+                  ["scene", "场景切换点", true]];
+  for (const [key, title, isPoint] of groups) {
+    const items = result[key] || [];
+    if (!items.length) continue;
+    parts.push(`<div><div class="detect-group-title">${title}（${items.length}）</div>`);
+    for (const it of items) {
+      const t = isPoint ? it.time : it.start;
+      const label = isPoint
+        ? `${timeLabel(it.time)} · 分数 ${Number(it.score).toFixed(2)}`
+        : `${timeLabel(it.start)} → ${timeLabel(it.end)} · ${Number(it.duration).toFixed(2)}s`;
+      parts.push(`<div class="detect-row" data-t="${t}"><span class="dr-time">${label}</span><span class="dr-dur">点击定位</span></div>`);
+    }
+    parts.push("</div>");
+  }
+  if (result.errors && Object.keys(result.errors).length) {
+    parts.push(`<div class="detect-empty">部分检测失败：${esc(Object.values(result.errors).join("；"))}</div>`);
+  }
+  box.innerHTML = parts.length ? parts.join("")
+    : '<div class="detect-empty">未检测到黑帧 / 静音 / 场景切换</div>';
+  box.querySelectorAll(".detect-row").forEach((row) =>
+    row.addEventListener("click", () => {
+      const v = $("player");
+      v.currentTime = Number(row.dataset.t);
+      v.play();
+    }));
+}
+
+async function runDetect() {
+  const f = state.selectedFile;
+  if (!f) return toast("请先预览一个视频", true);
+  const types = [...document.querySelectorAll("[data-detect-type]:checked")]
+    .map((el) => el.dataset.detectType);
+  if (!types.length) return toast("请至少选择一种检测类型", true);
+  const options = {
+    black_min: Number($("detectBlackMin").value) || 1,
+    black_pix_th: 0.1,
+    silence_noise: $("detectNoise").value.trim() || "-40dB",
+    silence_min: Number($("detectSilenceMin").value) || 1,
+    scene_threshold: Number($("detectSceneTh").value) || 0.4,
+  };
+  try {
+    await api("/api/detect", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: f.path, types, options }),
+    });
+    $("detectStatus").textContent = "检测任务已提交";
+    toast("检测任务已提交，完成后自动显示结果");
+    pollTasks();
+  } catch (e) { toast("检测失败: " + e.message, true); }
+}
+
+/* ---------- 元数据与标签 ---------- */
+
+const TAG_SOURCE_TEXT = {manual: "手动", auto: "自动", detected: "检测", imported: "导入"};
+
+async function loadMetadata() {
+  const f = state.selectedFile;
+  if (!f) {
+    $("metaDetail").innerHTML = '<div class="md-row">请先预览一个视频</div>';
+    $("tagList").innerHTML = "";
+    $("tagSuggest").textContent = "";
+    return;
+  }
+  try {
+    const info = await api("/api/metadata?path=" + encodeURIComponent(f.path));
+    const tags = info.format_tags || {};
+    $("metaTitle").value = tags.title || "";
+    $("metaComment").value = tags.comment || "";
+    $("metaArtist").value = tags.artist || "";
+    const audio = (info.streams || []).find((s) => s.codec_type === "audio");
+    $("metaLanguage").value = (audio && audio.tags && audio.tags.language) || "";
+    renderTags(info.tags || [], info.suggestions || []);
+    const rows = [
+      `容器：${info.format_name || "-"}`,
+      `时长：${fmtTime(info.duration || 0)}`,
+      `分辨率：${info.width}×${info.height}`,
+      `编码：${info.codec || "-"}`,
+      `流数量：${(info.streams || []).length}`,
+      `章节：${(info.chapters || []).length}`,
+    ];
+    const extra = Object.entries(tags)
+      .filter(([k]) => !["title", "comment", "artist"].includes(k))
+      .map(([k, v]) => `${k}：${v}`);
+    $("metaDetail").innerHTML = [...rows, ...extra]
+      .map((s) => `<div class="md-row">${esc(s)}</div>`).join("");
+  } catch (e) {
+    $("metaDetail").innerHTML = `<div class="md-row">读取失败：${esc(e.message)}</div>`;
+  }
+}
+
+function renderTags(tags, suggestions) {
+  $("tagList").innerHTML = tags.length ? tags.map((t, i) => `
+    <span class="tag-pill ${t.source !== "manual" ? "auto" : ""}">
+      ${esc(t.name)} <span class="tag-src">${TAG_SOURCE_TEXT[t.source] || t.source}</span>
+      <button class="tag-del" data-i="${i}" title="删除标签">×</button>
+    </span>`).join("") : '<span class="detect-empty">暂无标签</span>';
+  $("tagList").querySelectorAll(".tag-del").forEach((btn) =>
+    btn.addEventListener("click", () =>
+      deleteTag(tags[Number(btn.dataset.i)])));
+  $("tagSuggest").textContent = suggestions.length
+    ? "建议标签：" + suggestions.map((s) => s.name).join("、") : "";
+}
+
+async function deleteTag(tag) {
+  const f = state.selectedFile;
+  if (!f) return;
+  try {
+    await api("/api/tags", {
+      method: "DELETE", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: f.path, name: tag.name, source: tag.source }),
+    });
+    await loadMetadata();
+  } catch (e) { toast("删除标签失败: " + e.message, true); }
+}
+
+async function addTag() {
+  const f = state.selectedFile;
+  const name = $("tagNameInput").value.trim();
+  if (!f) return toast("请先预览一个视频", true);
+  if (!name) return toast("请输入标签名", true);
+  try {
+    await api("/api/tags", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: f.path, name, source: "manual", confidence: 1 }),
+    });
+    $("tagNameInput").value = "";
+    await loadMetadata();
+  } catch (e) { toast("添加标签失败: " + e.message, true); }
+}
+
+async function saveMetadata() {
+  const f = state.selectedFile;
+  if (!f) return toast("请先预览一个视频", true);
+  const format_tags = {};
+  for (const [key, id] of [["title", "metaTitle"], ["comment", "metaComment"],
+                           ["artist", "metaArtist"]]) {
+    const v = $(id).value.trim();
+    if (v) format_tags[key] = v;
+  }
+  const stream_tags = {};
+  const lang = $("metaLanguage").value.trim();
+  if (lang) {
+    try {
+      const info = await api("/api/metadata?path=" + encodeURIComponent(f.path));
+      const audio = (info.streams || []).find((s) => s.codec_type === "audio");
+      if (audio) stream_tags[String(audio.index)] = {language: lang};
+    } catch { /* 读取失败则跳过流标签 */ }
+  }
+  try {
+    await api("/api/metadata", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: f.path, format_tags, stream_tags }),
+    });
+    toast("元数据更新任务已提交");
+    pollTasks();
+  } catch (e) { toast("保存失败: " + e.message, true); }
+}
+
 /* ---------- 任务队列 ---------- */
 
 const STATUS_TEXT = { queued: "排队中", running: "处理中", done: "完成", failed: "失败" };
@@ -604,6 +805,11 @@ async function pollTasks() {
           await selectFile(cur, true);  // force 破缓存
         else if (cur && !state.files.some((f) => f.path === cur))
           toast("预览文件已不存在，已刷新列表", true);
+        // 检测/元数据任务完成后刷新当前面板（无需重播视频）
+        if (fresh.some((t) => t.kind === "detect") && currentOp() === "detect")
+          loadDetectResult();
+        if (fresh.some((t) => t.kind === "metadata") && currentOp() === "meta")
+          loadMetadata();
       }
     }
     const done = tasks.filter((t) => t.status === "done").length;
@@ -650,6 +856,10 @@ $("batchRotateBtn").addEventListener("click", () => doBatch("rotate"));
 $("batchDeleteBtn").addEventListener("click", doDelete);
 $("batchRenameBtn").addEventListener("click", doRename);
 $("batchConcatBtn").addEventListener("click", doConcat);
+$("runDetectBtn").addEventListener("click", runDetect);
+$("saveMetaBtn").addEventListener("click", saveMetadata);
+$("addTagBtn").addEventListener("click", addTag);
+$("tagNameInput").addEventListener("keydown", (e) => { if (e.key === "Enter") addTag(); });
 $("concatClearOrderBtn").addEventListener("click", () => {
   state.concatOrder = [];
   syncConcatOrder();  // 按当前文件列表顺序重建
@@ -690,6 +900,8 @@ $("opTabs").querySelectorAll(".op-tab").forEach((tab) => {
       card.hidden = card.dataset.opCard !== op;
     });
     if (op === "concat") syncConcatOrder();  // 切到拼接时按勾选实时重建顺序列表
+    if (op === "detect") loadDetectResult();
+    if (op === "meta") loadMetadata();
   });
 });
 $("taskFab").addEventListener("click", () => {

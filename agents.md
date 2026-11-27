@@ -19,6 +19,7 @@
 | `app/config.py` | 根目录配置读写、ffmpeg 路径、视频扩展名与 MIME 映射 |
 | `app/ffmpeg_service.py` | ffmpeg/ffprobe 封装：探测、截取、旋转、拼接的参数构建与执行 |
 | `app/task_queue.py` | 异步任务队列（2 并发）、Task 数据模型、进度与状态 |
+| `app/tag_store.py` | 本地标签库：多来源、置信度、扩展 meta，智能标签扩展点 |
 | `app/main.py` | FastAPI 应用：全部 API、静态文件挂载、路径安全校验、缩略图缓存 |
 | `static/index.html` | 单页应用结构 |
 | `static/style.css` | 样式 |
@@ -56,6 +57,9 @@ python run.py
 | POST | `/api/rotate` | 旋转任务（**替换原文件**） |
 | POST | `/api/concat` | 拼接任务（多文件、保留原文件） |
 | POST | `/api/batch` | 批量截取 / 旋转 |
+| GET / POST | `/api/metadata` | 完整元数据（容器/流标签、章节）/ 编辑元数据（走队列） |
+| GET / POST / DELETE | `/api/tags` | 标签读取（含建议）/ 新增 / 删除 |
+| GET / POST | `/api/detect` | 检测结果缓存读取 / 提交检测任务（黑帧/静音/场景） |
 | DELETE | `/api/delete` | 批量移入回收站 |
 | POST | `/api/rename` | 批量重命名（`基础名_序号.扩展名`） |
 | GET / DELETE | `/api/tasks` | 任务列表 / 清除已完成任务 |
@@ -75,6 +79,8 @@ python run.py
 8. **目录弹框置顶**：PowerShell `FolderBrowserDialog` + C# 后台线程（`FindWindowEx("#32770")` → `SetWindowPos(HWND_TOPMOST)` → `AttachThreadInput` + `SetForegroundWindow`）。所有 P/Invoke 必须包 try-catch，否则异常会触发 Windows 错误报告（`wermgr.exe`）抢走焦点，导致弹框被浏览器遮挡。
 9. **任务队列**：内存态、2 并发，服务重启后任务记录丢失（设计如此）；`clear()` 只清除已完成/失败任务。
 10. **前端**：原生 JS；`localStorage` 保存 `lastDir` 与 `showPreview`；静态资源 URL 带 `?v=` 破缓存，**修改前端后必须 bump `index.html` 中的版本号**；点击文件项即勾选并预览；拼接列表仅支持拖拽排序（无上下按钮）。
+11. **标签与智能标签扩展**：标签存于 `.workbuddy/tags.json`，按相对路径索引，与容器元数据解耦；每条标签含 `source`（manual/auto/detected/imported）、`confidence`、`meta`。智能标签后续只需在 `tag_store.suggest()` 接入规则/模型并返回同结构建议，前端与 API 无需改动。添加新来源时同步更新 `VALID_SOURCES`。
+12. **智能检测**：`blackdetect` / `silencedetect` 的输出在 **stderr**，`run_ffmpeg()` 的 `-loglevel error` 会压制，故检测走独立 `_analyze()`（`-loglevel info`）+ 正则解析；正则中的 `_NUM` 必须是**非捕获组**，否则嵌套捕获会导致解包失败。检测结果按「路径+mtime+size」缓存于 `.workbuddy/detections.json`。
 
 ## 6. 当前进展
 
@@ -86,6 +92,8 @@ python run.py
 - 批量删除、批量重命名、任务队列与进度
 - 缩略图 / 列表视图、排序、框选、70:30 可拖拽分栏
 - 视频拼接：拖拽排序、`copy` / `reencode` 双模式、保留原文件、输出名自动取首文件名 + `_拼接`
+- 智能检测：黑帧 / 静音 / 场景切换，结果可点击定位
+- 元数据读取与编辑、本地标签库（智能标签扩展点）
 - 路径记忆、预览显隐、文件夹选择弹框置顶
 - 功能区 tabs：截取 / 旋转 / 删除 / 重命名 / 拼接
 

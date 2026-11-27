@@ -1,8 +1,11 @@
 """Video NAS Tools — NAS 视频批量管理 Web 应用（FastAPI + ffmpeg）。"""
 import asyncio
 import hashlib
+import json
+import os
 import re
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -13,7 +16,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import ffmpeg_service as ff
-from .config import (DEFAULT_ROOT, MIME_MAP, VIDEO_EXTS, get_root,
+from . import tag_store
+from .config import (BASE_DIR, DEFAULT_ROOT, MIME_MAP, VIDEO_EXTS, get_root,
                      load_settings, set_root)
 from .task_queue import TaskQueue
 
@@ -410,6 +414,190 @@ async def probe_file(path: str):
         raise HTTPException(500, str(e))
     info["name"] = p.name
     return info
+
+
+# ---------- 元数据读取 / 编辑 ----------
+
+@app.get("/api/metadata")
+async def get_metadata(path: str):
+    """完整元数据：容器/流标签、章节，以及本地标签。"""
+    p = require_video(safe_resolve(path))
+    rel = rel_posix(p)
+    try:
+        info = await ff.probe(p, detailed=True)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, str(e))
+    info["name"] = p.name
+    info["path"] = rel
+    info["tags"] = tag_store.get(rel)
+    info["suggestions"] = tag_store.suggest(rel)  # 智能标签扩展点
+    return info
+
+
+class MetadataReq(BaseModel):
+    path: str
+    format_tags: dict = Field(default_factory=dict)
+    stream_tags: dict = Field(default_factory=dict)
+
+
+@app.post("/api/metadata")
+async def update_metadata(req: MetadataReq):
+    """重写容器/流元数据（stream copy），走队列并原子替换原文件，保留 mtime。"""
+    src = require_video(safe_resolve(req.path))
+    rel = rel_posix(src)
+    tmp = src.with_name(
+        f"{src.stem}.meta_tmp_{uuid.uuid4().hex[:8]}{src.suffix}")
+    lock = file_lock(str(src))
+
+    async def job(on_progress):
+        async with lock:
+            st = src.stat()
+            orig_times = (st.st_atime, st.st_mtime)
+            info = await ff.probe(src)
+            try:
+                await ff.run_ffmpeg(
+                    ff.build_metadata_args(
+                        src, tmp, req.format_tags, req.stream_tags),
+                    info["duration"], on_progress)
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                raise
+            for attempt in range(6):
+                try:
+                    tmp.replace(src)
+                    break
+                except PermissionError:
+                    if attempt == 5:
+                        raise RuntimeError(
+                            f"文件被占用，请关闭后重试；已生成的临时文件保留为 {tmp.name}")
+                    await asyncio.sleep(0.5)
+            try:
+                os.utime(src, orig_times)
+            except OSError:
+                pass
+            invalidate_thumbnail(src)
+
+    task = await queue.submit(
+        "metadata", f"更新元数据 {src.name}", rel, rel, job)
+    return {"taskId": task.id, "status": task.status}
+
+
+# ---------- 标签（与容器元数据解耦，预留智能标签） ----------
+
+class TagReq(BaseModel):
+    path: str
+    name: str
+    source: str = "manual"
+    confidence: float = 1.0
+    meta: dict = Field(default_factory=dict)
+
+
+class TagDeleteReq(BaseModel):
+    path: str
+    name: str
+    source: Optional[str] = None
+
+
+@app.get("/api/tags")
+async def get_tags(path: str = ""):
+    if not path:
+        return {"all": tag_store.all_tags()}
+    p = require_video(safe_resolve(path))
+    rel = rel_posix(p)
+    return {"path": rel, "tags": tag_store.get(rel),
+            "suggestions": tag_store.suggest(rel)}
+
+
+@app.post("/api/tags")
+async def add_tag(req: TagReq):
+    p = require_video(safe_resolve(req.path))
+    rel = rel_posix(p)
+    try:
+        tags = tag_store.add(rel, req.name, req.source, req.confidence, req.meta)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"tags": tags}
+
+
+@app.delete("/api/tags")
+async def delete_tag(req: TagDeleteReq):
+    p = require_video(safe_resolve(req.path))
+    rel = rel_posix(p)
+    return {"tags": tag_store.remove(rel, req.name, req.source)}
+
+
+# ---------- 智能检测（黑帧 / 静音 / 场景切换） ----------
+
+DETECT_FILE = BASE_DIR / ".workbuddy" / "detections.json"
+
+
+def _detections_load() -> dict:
+    try:
+        if DETECT_FILE.exists():
+            data = json.loads(DETECT_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except (json.JSONDecodeError, OSError, ValueError):
+        pass
+    return {}
+
+
+def _detections_save(data: dict) -> None:
+    DETECT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DETECT_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _detect_key(p: Path) -> str:
+    st = p.stat()
+    return f"{rel_posix(p)}|{int(st.st_mtime * 1000)}|{st.st_size}"
+
+
+class DetectReq(BaseModel):
+    path: str
+    types: list[str] = Field(default_factory=lambda: ["black", "silence"])
+    options: dict = Field(default_factory=dict)
+
+
+@app.get("/api/detect")
+async def get_detection(path: str):
+    """读取检测结果缓存；无缓存返回 status=none。"""
+    p = require_video(safe_resolve(path))
+    cached = _detections_load().get(_detect_key(p))
+    if cached and cached.get("status") == "done":
+        return {"status": "done", "result": cached["result"],
+                "updated_at": cached.get("updated_at")}
+    return {"status": "none"}
+
+
+@app.post("/api/detect")
+async def run_detection(req: DetectReq):
+    p = require_video(safe_resolve(req.path))
+    types = [t for t in req.types if t in ("black", "silence", "scene")]
+    if not types:
+        raise HTTPException(400, "types 必须是 black/silence/scene 之一")
+    noise = str(req.options.get("silence_noise", "-40dB"))
+    if not re.fullmatch(r"-?\d+(?:\.\d+)?(?:dB|%)?", noise):
+        raise HTTPException(400, "silence_noise 格式无效")
+    for key in ("black_min", "black_pix_th", "silence_min", "scene_threshold"):
+        if key in req.options:
+            try:
+                float(req.options[key])
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"{key} 必须是数字")
+    rel = rel_posix(p)
+
+    async def job(on_progress):
+        result = await ff.detect_media(p, types, req.options, on_progress)
+        data = _detections_load()
+        data[_detect_key(p)] = {
+            "status": "done", "result": result,
+            "updated_at": time.time(), "types": types}
+        _detections_save(data)
+
+    task = await queue.submit(
+        "detect", f"检测 {p.name}", rel, rel, job)
+    return {"taskId": task.id, "status": task.status}
 
 
 # ---------- 视频流（支持 Range，供 <video> 播放） ----------
