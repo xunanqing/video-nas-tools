@@ -71,7 +71,7 @@ body.selecting-files { user-select: none; }
 body.selecting-files .grid-item img { pointer-events: none; }
 .file-item.box-hit, .grid-item.box-hit { background: #dbeafe; outline: 1px solid #93c5fd; }
 .file-toolbar {
-  display: flex; align-items: center; gap: 6px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
   padding: 6px 6px; margin: 6px 0 4px;
   border-top: 1px solid var(--border); border-bottom: 1px dashed var(--border);
 }
@@ -88,6 +88,32 @@ body.selecting-files .grid-item img { pointer-events: none; }
   background: var(--panel); color: var(--text); font: inherit; font-size: 12px; cursor: pointer;
 }
 #clearCheckBtn { margin-left: auto; }
+
+.dedup-dialog {
+  width: min(620px, calc(100% - 32px)); max-height: calc(100% - 32px);
+  margin: auto; padding: 20px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--panel); color: var(--text);
+  box-shadow: var(--shadow); overflow: auto;
+}
+.dedup-dialog::backdrop { background: rgb(15 23 42 / 42%); }
+.dedup-heading, .dedup-controls {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 10px;
+  margin-bottom: 12px;
+}
+.dedup-heading { justify-content: space-between; }
+.dedup-heading h2 { font-size: 18px; }
+#dedupFolder { display: block; margin: 4px 0 12px; overflow-wrap: anywhere; }
+#dedupThreshold {
+  width: 66px; padding: 4px; border: 1px solid var(--border);
+  border-radius: 4px; font: inherit;
+}
+#dedupStatus { color: var(--muted); }
+.dedup-results { list-style: none; }
+.dedup-results > li {
+  padding: 8px 0; margin-top: 8px; border-top: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.dedup-results ul { list-style: none; }
 
 /* 缩略图网格视图 */
 .file-grid {

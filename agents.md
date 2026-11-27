@@ -19,6 +19,10 @@
 | `app/config.py` | 根目录配置读写、ffmpeg 路径、视频扩展名与 MIME 映射 |
 | `app/ffmpeg_service.py` | ffmpeg/ffprobe 封装：探测、截取、旋转、拼接的参数构建与执行 |
 | `app/task_queue.py` | 异步任务队列（2 并发）、Task 数据模型、进度与状态 |
+| `app/dedup/` | 第一阶段只读查重 CLI、Web 扫描、灰度匹配与 SQLite 缓存 |
+| `dedup.bat` | Windows 查重 CLI 启动入口 |
+| `tests/test_dedup.py` | 查重单元测试与合成视频集成测试 |
+| `docs/video-dedup.md` | VDF 源码核查、查重路线及验证记录 |
 | `app/main.py` | FastAPI 应用：全部 API、静态文件挂载、路径安全校验、缩略图缓存 |
 | `static/index.html` | 单页应用结构 |
 | `static/style.css` | 样式 |
@@ -37,7 +41,7 @@ python run.py
 ```
 
 - ffmpeg 路径可由环境变量 `FFMPEG_PATH` / `FFPROBE_PATH` 覆盖。
-- 目录选择弹框依赖 Windows（`PowerShell` + `System.Windows.Forms`）；Python 环境无 tkinter，勿改回 tkinter 方案。
+- 原生目录选择在服务端桌面打开。Windows 用 PowerShell／Windows Forms，macOS 用系统自带的 `osascript`。Linux／NAS 无桌面环境时手填服务端挂载目录，容器内使用容器挂载路径。
 - 服务绑定 `127.0.0.1`，**无用户认证**，不要暴露到公网。
 
 ## 4. API 清单
@@ -46,7 +50,8 @@ python run.py
 | --- | --- | --- |
 | GET | `/` | 单页应用 |
 | GET / POST | `/api/settings` | 读取 / 设置视频根目录 |
-| POST | `/api/pick-folder` | 弹出系统文件夹选择框（Windows） |
+| POST | `/api/pick-folder` | 在 Windows／macOS 服务端弹出系统文件夹选择框 |
+| POST | `/api/dedup/scan` | 只读扫描当前目录及子目录并返回匹配结果 |
 | GET | `/api/files?path=` | 列出目录内容（相对根目录路径） |
 | GET | `/api/stream?path=` | 视频流，支持 HTTP Range / 206 |
 | GET | `/api/probe?path=` | ffprobe 元信息（时长、尺寸、旋转角、音轨等） |
@@ -56,7 +61,7 @@ python run.py
 | POST | `/api/rotate` | 旋转任务（**替换原文件**） |
 | POST | `/api/concat` | 拼接任务（多文件、保留原文件） |
 | POST | `/api/batch` | 批量截取 / 旋转 |
-| DELETE | `/api/delete` | 批量移入回收站 |
+| POST | `/api/delete` | 批量移入回收站 |
 | POST | `/api/rename` | 批量重命名（`基础名_序号.扩展名`） |
 | GET / DELETE | `/api/tasks` | 任务列表 / 清除已完成任务 |
 
@@ -98,7 +103,7 @@ python run.py
 
 ## 7. 待办与风险
 
-- 项目暂无自动化测试和 README（如需面向人类阅读可补充）。
+- 已有中文 README 与查重自动化测试。现有 Web 功能仍需手动回归验证。
 - 无认证机制，仅限本机使用。
 - 任务队列为内存态，重启清空。
 - 修改前端后若忘记 bump 版本号，用户浏览器可能加载旧缓存。
@@ -109,3 +114,11 @@ python run.py
 - 本地验证可使用 `videos/testdir/` 中的样片。
 - 提交前确认 `settings.json`、`videos/`、`.thumbnails/`、`.workbuddy/` 未被纳入版本控制。
 - 详细迭代历史见 `.workbuddy/memory/2026-11-27.md`。
+
+## 9. 视频查重协作交接
+
+- 第一阶段提供 `python -m app.dedup.cli` 和 `dedup.bat`。支持多目录递归、SHA-256 全文件查重、CPU 32×32 灰度比较与本地 SQLite 特征复用。扫描只读视频并输出 JSON Lines。
+- 文件列表工具栏已有「视频查重」。Web 基线扫描当前目录及子目录，显示结果和读取失败数量。大型目录、多根目录界面和持久化任务仍按阶段计划推进。无桌面 NAS 上通过「输入路径」设置挂载目录。
+- 在 [视频查重源码调研与实施计划](docs/video-dedup.md) 查看固定提交的 VDF 源码定位、各阶段范围、验收方法和结果。后续每阶段更新此文档，写明实现、测试环境、复现命令、结果与待验证项，供各 Agent 和 PC 测试同步。
+- 当前开发机是 Intel macOS。用户的 Windows 10 PC 配有双 RTX 2080 Ti，通过 SMB 读取飞牛 NAS。第一阶段合成测试在 macOS 已通过。Windows BAT、实际共享目录及真实素材准确率待在 PC 验收，再进入 pHash、旋转和镜像阶段。
+- 后续 Web 集成需延续相对路径边界校验；旋转保留 mtime，原地替换成功后须失效查重缓存。扫描和相似度结果本身不触发任何视频写入或删除。验证使用合成文件或可丢弃测试副本。

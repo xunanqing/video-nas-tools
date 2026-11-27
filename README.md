@@ -20,7 +20,7 @@
 
 - Python 3.12+
 - `ffmpeg` 与 `ffprobe` 已加入 PATH
-- Windows（用于「浏览」按钮的系统文件夹选择框；其他平台可手动输入路径）
+- Windows 或 macOS 桌面可使用「浏览」按钮打开系统目录选择框。Linux／NAS 服务使用「输入路径」。
 
 安装与启动：
 
@@ -40,7 +40,7 @@ set FFPROBE_PATH=C:\tools\ffmpeg\bin\ffprobe.exe
 
 ## 使用指南
 
-1. **设置根目录**：在顶部输入视频目录，或点「浏览」用系统对话框选择。路径会保存在本地，下次打开自动恢复。
+1. **设置根目录**：在顶部输入视频目录，或在 Windows／macOS 本机服务上点「浏览」用系统对话框选择。选择后自动保存，手动输入后点「保存」。
 2. **选择文件**：点击列表项或缩略图即勾选并预览；按住 Shift / Ctrl 可追加选择，也可在列表区域拖拽框选。左侧工具栏提供视图切换、排序、全选和取消勾选。
 3. **功能操作**：勾选文件后右侧功能区显示五个标签页——截取、旋转、删除、重命名、拼接。切换到对应标签页完成参数设置后执行。
 4. **拼接排序**：在「拼接」标签页中直接拖拽行调整顺序，左侧序号即最终拼接顺序。
@@ -63,6 +63,21 @@ set FFPROBE_PATH=C:\tools\ffmpeg\bin\ffprobe.exe
 - `app/config.py` — 配置与路径安全
 - `app/task_queue.py` — 异步任务队列
 - `static/` — 前端页面、样式与交互
+
+## 视频查重
+
+在文件列表工具栏点击「视频查重」，可对当前目录及子目录执行只读扫描。窗口显示完全相同的文件组、内容相似的文件对和读取失败计数。独立 CLI 支持扫描多个目录、输出 JSON Lines。两种入口都使用 SHA-256 和灰度抽帧，SQLite 缓存在运行机本地，可用 `VIDEO_NAS_DEDUP_CACHE` 指定本地数据库文件。
+
+```bat
+dedup.bat "D:\dedup-test" "\\fnos\media\dedup-test" --threshold 0.96 > "%TEMP%\dedup-results.jsonl"
+python -m unittest discover -s tests -v
+```
+
+将示例目录换成实际的测试目录。其他平台用 `python -m app.dedup.cli` 代替 `dedup.bat`。视觉模式需要 FFmpeg 与 FFprobe，`--exact-only` 可只运行字节查重。源码分析、缓存参数和 Windows／SMB 验收见[视频查重源码调研与实施计划](docs/video-dedup.md)。
+
+## NAS 路径
+
+程序在 NAS 上运行时，填写 NAS 服务进程能访问的路径。使用容器时，先把共享目录挂载到容器，例如 `/media/videos`，再将该容器内路径保存为根目录。若程序运行在 Mac 且已通过 Finder 挂载 SMB 共享，可在「浏览」对话框选择相应卷，也可手填 `/Volumes/共享名`。
 
 ## 注意事项
 

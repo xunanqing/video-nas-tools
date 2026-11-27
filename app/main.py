@@ -1,8 +1,12 @@
 """Video NAS Tools — NAS 视频批量管理 Web 应用（FastAPI + ffmpeg）。"""
 import asyncio
 import hashlib
+import logging
+import os
 import re
+import sqlite3
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -15,11 +19,15 @@ from pydantic import BaseModel, Field
 from . import ffmpeg_service as ff
 from .config import (DEFAULT_ROOT, MIME_MAP, VIDEO_EXTS, get_root,
                      load_settings, set_root)
+from .dedup.web import invalidate_features, scan_folder
 from .task_queue import TaskQueue
 
 app = FastAPI(title="Video NAS Tools")
 queue = TaskQueue(workers=2)
+dedup_lock = asyncio.Lock()
+picker_lock = asyncio.Lock()
 CHUNK_SIZE = 1024 * 1024
+LOGGER = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 THUMB_DIR = Path(__file__).resolve().parent.parent / ".thumbnails"
@@ -71,7 +79,7 @@ async def index():
 
 @app.get("/api/settings")
 async def read_settings():
-    return {"root": str(get_root())}
+    return {"root": str(get_root()), "native_folder_picker": sys.platform in {"win32", "darwin"}}
 
 
 class SettingsReq(BaseModel):
@@ -165,10 +173,29 @@ public class PickerTop {
 $d = New-Object System.Windows.Forms.FolderBrowserDialog
 $d.ShowNewFolderButton = $false;
 $d.Description = '选择 NAS 视频根目录'
+if ($env:VIDEO_NAS_PICKER_INITIAL) { $d.SelectedPath = $env:VIDEO_NAS_PICKER_INITIAL }
 [PickerTop]::Start([uint32][System.Diagnostics.Process]::GetCurrentProcess().Id)
 $result = $d.ShowDialog()
 [PickerTop]::Stop()
 if ($result -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.SelectedPath }
+"""
+
+_MAC_PICK = """
+on run argv
+    try
+        activate
+        set folderPrompt to "选择 NAS 视频根目录"
+        if (count of argv) > 0 then
+            set initialFolder to POSIX file (item 1 of argv) as alias
+            set selectedFolder to choose folder with prompt folderPrompt default location initialFolder
+        else
+            set selectedFolder to choose folder with prompt folderPrompt
+        end if
+        return POSIX path of selectedFolder
+    on error number -128
+        return ""
+    end try
+end run
 """
 
 
@@ -179,27 +206,63 @@ class PickReq(BaseModel):
 
 @app.post("/api/pick-folder")
 async def pick_folder(req: PickReq):
-    """弹出系统原生目录选择对话框（PowerShell STA 线程），返回所选路径。"""
-    script = _PS_PICK
-    if req.initial and Path(req.initial).is_dir():
-        safe = req.initial.replace("'", "''")
-        script = script.replace(
-            "$d.ShowNewFolderButton = $false;",
-            f"$d.ShowNewFolderButton = $false; $d.SelectedPath = '{safe}';")
-
-    def run():
+    """在运行服务的桌面上打开原生目录选择器。"""
+    if sys.platform not in {"win32", "darwin"}:
+        raise HTTPException(501, "请填写服务端可访问的目录路径，例如 /media/videos，然后保存")
+    if picker_lock.locked():
+        raise HTTPException(409, "已有目录选择窗口打开")
+    async with picker_lock:
         try:
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-STA", "-Command", script],
-                capture_output=True, timeout=req.timeout,
-                encoding="utf-8", errors="replace",
-                creationflags=subprocess.CREATE_NO_WINDOW)
-            return r.stdout.strip() or None if r.returncode == 0 else None
-        except (subprocess.TimeoutExpired, OSError):
-            return None
-
-    path = await asyncio.to_thread(run)
+            path = await asyncio.to_thread(_run_picker, req)
+        except subprocess.TimeoutExpired as exc:
+            raise HTTPException(408, "目录选择已超时") from exc
+        except (subprocess.CalledProcessError, OSError) as exc:
+            LOGGER.warning("目录选择器启动或运行失败 %s", getattr(exc, "stderr", None) or exc)
+            raise HTTPException(503, "无法打开服务端的目录选择器，请直接填写目录路径") from exc
     return {"path": path}
+
+
+def _run_picker(req: PickReq) -> str | None:
+    initial = Path(req.initial) if req.initial else None
+    location = str(initial.absolute()) if initial and initial.is_dir() else ""
+    if sys.platform == "win32":
+        command = ["powershell", "-NoProfile", "-STA", "-Command", _PS_PICK]
+        platform_options = {
+            "creationflags": subprocess.CREATE_NO_WINDOW,
+            "env": {**os.environ, "VIDEO_NAS_PICKER_INITIAL": location},
+        }
+    else:
+        command = ["/usr/bin/osascript", "-e", _MAC_PICK, "--"]
+        if location:
+            command.append(location)
+        platform_options = {}
+    completed = subprocess.run(
+        command, capture_output=True, check=True, timeout=req.timeout,
+        encoding="utf-8", errors="replace", **platform_options,
+    )
+    return completed.stdout.rstrip("\r\n") or None
+
+
+# ---------- 视频查重 ----------
+
+class DedupReq(BaseModel):
+    path: str = ""
+    threshold: float = Field(default=0.96, ge=0, le=1)
+    exact_only: bool = False
+
+
+@app.post("/api/dedup/scan")
+async def dedup_scan(req: DedupReq):
+    folder = safe_resolve(req.path)
+    if not folder.is_dir():
+        raise HTTPException(404, "扫描目录不存在")
+    if dedup_lock.locked():
+        raise HTTPException(409, "已有查重扫描正在运行")
+    async with dedup_lock:
+        try:
+            return await asyncio.to_thread(scan_folder, folder, req.threshold, req.exact_only)
+        except (OSError, sqlite3.Error) as exc:
+            raise HTTPException(503, str(exc)) from exc
 
 
 # ---------- 批量删除（移入回收站） ----------
@@ -560,6 +623,10 @@ async def submit_rotate(rel: str, degree: int, lossless: bool):
 
             # mtime 未变，缓存 key 无法感知内容变化 → 主动失效旧缩略图
             invalidate_thumbnail(src)
+            try:
+                await asyncio.to_thread(invalidate_features, src)
+            except (OSError, sqlite3.Error) as exc:
+                LOGGER.warning("清除查重特征失败 %s", exc)
 
     return await queue.submit(
         "rotate", f"旋转{degree}°并替换 {src.name}", rel, rel, job)

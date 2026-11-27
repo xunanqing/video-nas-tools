@@ -3,6 +3,8 @@
 
 const $ = (id) => document.getElementById(id);
 const state = {
+  root: "",
+  nativeFolderPicker: true,
   currentDir: "",
   parentDir: null,
   files: [],           // {name, path, size, mtime}
@@ -73,8 +75,15 @@ function esc(s) {
 
 async function loadSettings() {
   try {
-    const { root } = await api("/api/settings");
+    const { root, native_folder_picker } = await api("/api/settings");
+    state.root = root;
+    state.nativeFolderPicker = native_folder_picker;
     $("rootInput").value = root;
+    if (!native_folder_picker) {
+      $("rootInput").placeholder = "服务端视频目录，如 /media/videos";
+      $("pickBtn").textContent = "输入路径";
+      $("pickBtn").title = "输入 NAS 或容器内已挂载的视频目录";
+    }
   } catch (e) { toast("读取设置失败: " + e.message, true); }
 }
 
@@ -85,6 +94,7 @@ async function saveRoot() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ root: $("rootInput").value.trim() }),
     });
+    state.root = root;
     $("rootInput").value = root;
     state.currentDir = "";
     state.checked.clear();
@@ -97,6 +107,12 @@ async function saveRoot() {
 }
 
 async function pickRoot() {
+  if (!state.nativeFolderPicker) {
+    $("rootInput").select();
+    $("rootInput").focus();
+    toast("请填写服务端可访问的视频目录，然后保存");
+    return;
+  }
   const btn = $("pickBtn");
   btn.disabled = true;
   btn.textContent = "⏳ 选择中...";
@@ -114,6 +130,69 @@ async function pickRoot() {
   } finally {
     btn.disabled = false;
     btn.textContent = "📂 浏览";
+  }
+}
+
+/* ---------- 视频查重 ---------- */
+
+let dedupFolder = null;
+
+function openDedup() {
+  const label = state.currentDir ? `${state.root} / ${state.currentDir}` : state.root;
+  if (!$("dedupScanBtn").disabled && dedupFolder?.label !== label) {
+    dedupFolder = { path: state.currentDir, label };
+    $("dedupFolder").textContent = label;
+    $("dedupStatus").textContent = "";
+    $("dedupResults").replaceChildren();
+  }
+  $("dedupDialog").showModal();
+}
+
+async function startDedup(event) {
+  event.preventDefault();
+  const button = $("dedupScanBtn");
+  if (button.disabled || !dedupFolder) return;
+  const status = $("dedupStatus");
+  const results = $("dedupResults");
+  button.disabled = true;
+  status.textContent = "正在扫描…";
+  results.replaceChildren();
+  try {
+    const request = { path: dedupFolder.path, exact_only: $("dedupExactOnly").checked };
+    if (!request.exact_only) request.threshold = $("dedupThreshold").valueAsNumber / 100;
+    const { summary, matches } = await api("/api/dedup/scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+    });
+    const total = summary.exact_groups + summary.visual_pairs;
+    status.textContent = `已扫描 ${summary.files} 个视频，找到 ${summary.exact_groups} 组完全相同、${summary.visual_pairs} 对内容相似`
+      + (summary.errors ? `，${summary.errors} 项读取失败` : "")
+      + (matches.length < total ? `。显示前 ${matches.length} 条` : "。");
+    for (const match of matches) {
+      const row = document.createElement("li");
+      const heading = document.createElement("strong");
+      heading.textContent = match.type === "exact"
+        ? `完全相同 · ${match.path_count} 个文件`
+        : `相似度 ${(match.similarity * 100).toFixed(1)}%`;
+      const paths = document.createElement("ul");
+      for (const path of match.paths) {
+        const item = document.createElement("li");
+        item.textContent = path;
+        paths.append(item);
+      }
+      if (match.paths.length < match.path_count) {
+        const rest = document.createElement("li");
+        rest.textContent = `另有 ${match.path_count - match.paths.length} 个文件`;
+        paths.append(rest);
+      }
+      row.append(heading, paths);
+      results.append(row);
+    }
+  } catch (e) {
+    status.textContent = `扫描失败：${e.message}`;
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -634,6 +713,12 @@ function renderTasks(tasks) {
 $("rootSaveBtn").addEventListener("click", saveRoot);
 $("rootInput").addEventListener("keydown", (e) => e.key === "Enter" && saveRoot());
 $("pickBtn").addEventListener("click", pickRoot);
+$("dedupBtn").addEventListener("click", openDedup);
+$("dedupCloseBtn").addEventListener("click", () => $("dedupDialog").close());
+$("dedupForm").addEventListener("submit", startDedup);
+$("dedupExactOnly").addEventListener("change", (e) => {
+  $("dedupThreshold").disabled = e.target.checked;
+});
 $("playRangeBtn").addEventListener("click", playRange);
 function updatePreviewToggleBtn() {
   $("previewToggleBtn").textContent = state.showPreview ? "🎬 隐藏预览" : "🎬 显示预览";
