@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Video NAS Tools</title>
-<link rel="stylesheet" href="/static/style.css?v=20261127e">
+<link rel="stylesheet" href="/static/style.css?v=20261127g">
 </head>
 <body>
 <header>
@@ -73,6 +73,8 @@
         <button class="op-tab" data-op="delete">🗑️ 删除</button>
         <button class="op-tab" data-op="rename">📝 重命名</button>
         <button class="op-tab" data-op="concat">🔗 拼接</button>
+        <button class="op-tab" data-op="detect">🔍 检测</button>
+        <button class="op-tab" data-op="meta">🏷️ 元数据</button>
       </div>
 
       <div class="op-pane" id="opCard-cut" data-op-card="cut">
@@ -162,6 +164,49 @@
           <button id="batchConcatBtn" class="btn primary">🔗 拼接</button>
         </div>
       </div>
+
+      <div class="op-pane" id="opCard-detect" data-op-card="detect" hidden>
+        <div class="concat-hint">分析当前预览视频中的黑帧、静音与场景切换点；结果可点击定位。</div>
+        <div class="opt-row">
+          <label class="check"><input type="checkbox" data-detect-type="black" checked> 黑帧</label>
+          <label class="check"><input type="checkbox" data-detect-type="silence" checked> 静音</label>
+          <label class="check"><input type="checkbox" data-detect-type="scene"> 场景切换</label>
+        </div>
+        <div class="detect-opts">
+          <label>最短黑帧 <input id="detectBlackMin" type="number" min="0.1" step="0.1" value="1"></label>
+          <label>静音阈值 <input id="detectNoise" type="text" value="-40dB"></label>
+          <label>最短静音 <input id="detectSilenceMin" type="number" min="0.1" step="0.1" value="1"></label>
+          <label>场景阈值 <input id="detectSceneTh" type="number" min="0.1" max="1" step="0.1" value="0.4"></label>
+        </div>
+        <div class="op-actions">
+          <button id="runDetectBtn" class="btn primary">🔍 开始检测</button>
+          <span id="detectStatus" class="detect-status"></span>
+        </div>
+        <div id="detectResult" class="detect-result"></div>
+      </div>
+
+      <div class="op-pane" id="opCard-meta" data-op-card="meta" hidden>
+        <div class="concat-hint">编辑写入视频文件的元数据；标签保存在本地标签库，与文件解耦，便于后续智能标签扩展。</div>
+        <div class="meta-editor">
+          <label>标题 <input id="metaTitle" type="text" placeholder="title"></label>
+          <label>备注 <input id="metaComment" type="text" placeholder="comment"></label>
+          <label>作者 <input id="metaArtist" type="text" placeholder="artist"></label>
+          <label>语言 <input id="metaLanguage" type="text" placeholder="如 chi / eng"></label>
+        </div>
+        <div class="op-actions">
+          <button id="saveMetaBtn" class="btn primary">💾 保存元数据</button>
+        </div>
+        <div class="tag-section">
+          <div class="tag-head">标签</div>
+          <div id="tagList" class="tag-list"></div>
+          <div class="tag-input-row">
+            <input id="tagNameInput" type="text" placeholder="输入标签名">
+            <button id="addTagBtn" class="btn ghost sm">＋ 添加</button>
+          </div>
+          <div id="tagSuggest" class="tag-suggest"></div>
+        </div>
+        <div id="metaDetail" class="meta-detail"></div>
+      </div>
     </div>
   </section>
 </main>
@@ -197,6 +242,6 @@
 </div>
 
 <div id="toast" class="toast"></div>
-<script src="/static/app.js?v=20261127f"></script>
+<script src="/static/app.js?v=20261127g"></script>
 </body>
 </html>

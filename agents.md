@@ -19,6 +19,7 @@
 | `app/config.py` | 根目录配置读写、ffmpeg 路径、视频扩展名与 MIME 映射 |
 | `app/ffmpeg_service.py` | ffmpeg/ffprobe 封装：探测、截取、旋转、拼接的参数构建与执行 |
 | `app/task_queue.py` | 异步任务队列（2 并发）、Task 数据模型、进度与状态 |
+| `app/tag_store.py` | 本地标签库：多来源、置信度、扩展 meta，智能标签扩展点 |
 | `app/dedup/` | 第一阶段只读查重 CLI、Web 扫描、灰度匹配与 SQLite 缓存 |
 | `dedup.bat` | Windows 查重 CLI 启动入口 |
 | `tests/test_dedup.py` | 查重单元测试与合成视频集成测试 |
@@ -61,6 +62,9 @@ python run.py
 | POST | `/api/rotate` | 旋转任务（**替换原文件**） |
 | POST | `/api/concat` | 拼接任务（多文件、保留原文件） |
 | POST | `/api/batch` | 批量截取 / 旋转 |
+| GET / POST | `/api/metadata` | 完整元数据（容器/流标签、章节）/ 编辑元数据（走队列） |
+| GET / POST / DELETE | `/api/tags` | 标签读取（含建议）/ 新增 / 删除 |
+| GET / POST | `/api/detect` | 检测结果缓存读取 / 提交检测任务（黑帧/静音/场景） |
 | POST | `/api/delete` | 批量移入回收站 |
 | POST | `/api/rename` | 批量重命名（`基础名_序号.扩展名`） |
 | GET / DELETE | `/api/tasks` | 任务列表 / 清除已完成任务 |
@@ -80,6 +84,8 @@ python run.py
 8. **目录弹框置顶**：PowerShell `FolderBrowserDialog` + C# 后台线程（`FindWindowEx("#32770")` → `SetWindowPos(HWND_TOPMOST)` → `AttachThreadInput` + `SetForegroundWindow`）。所有 P/Invoke 必须包 try-catch，否则异常会触发 Windows 错误报告（`wermgr.exe`）抢走焦点，导致弹框被浏览器遮挡。
 9. **任务队列**：内存态、2 并发，服务重启后任务记录丢失（设计如此）；`clear()` 只清除已完成/失败任务。
 10. **前端**：原生 JS；`localStorage` 保存 `lastDir` 与 `showPreview`；静态资源 URL 带 `?v=` 破缓存，**修改前端后必须 bump `index.html` 中的版本号**；点击文件项即勾选并预览；拼接列表仅支持拖拽排序（无上下按钮）。
+11. **标签与智能标签扩展**：标签存于 `.workbuddy/tags.json`，按相对路径索引，与容器元数据解耦；每条标签含 `source`（manual/auto/detected/imported）、`confidence`、`meta`。智能标签后续只需在 `tag_store.suggest()` 接入规则/模型并返回同结构建议，前端与 API 无需改动。添加新来源时同步更新 `VALID_SOURCES`。
+12. **智能检测**：`blackdetect` / `silencedetect` 的输出在 **stderr**，`run_ffmpeg()` 的 `-loglevel error` 会压制，故检测走独立 `_analyze()`（`-loglevel info`）+ 正则解析；正则中的 `_NUM` 必须是**非捕获组**，否则嵌套捕获会导致解包失败。检测结果按「路径+mtime+size」缓存于 `.workbuddy/detections.json`。
 
 ## 6. 当前进展
 
@@ -91,8 +97,10 @@ python run.py
 - 批量删除、批量重命名、任务队列与进度
 - 缩略图 / 列表视图、排序、框选、70:30 可拖拽分栏
 - 视频拼接：拖拽排序、`copy` / `reencode` 双模式、保留原文件、输出名自动取首文件名 + `_拼接`
+- 智能检测：黑帧 / 静音 / 场景切换，结果可点击定位
+- 元数据读取与编辑、本地标签库（智能标签扩展点）
 - 路径记忆、预览显隐、文件夹选择弹框置顶
-- 功能区 tabs：截取 / 旋转 / 删除 / 重命名 / 拼接
+- 功能区 tabs：截取 / 旋转 / 删除 / 重命名 / 拼接 / 检测 / 元数据
 
 已验证结论：
 
@@ -121,4 +129,4 @@ python run.py
 - 文件列表工具栏已有「视频查重」。Web 基线扫描当前目录及子目录，显示结果和读取失败数量。大型目录、多根目录界面和持久化任务仍按阶段计划推进。无桌面 NAS 上通过「输入路径」设置挂载目录。
 - 在 [视频查重源码调研与实施计划](docs/video-dedup.md) 查看固定提交的 VDF 源码定位、各阶段范围、验收方法和结果。后续每阶段更新此文档，写明实现、测试环境、复现命令、结果与待验证项，供各 Agent 和 PC 测试同步。
 - 当前开发机是 Intel macOS。用户的 Windows 10 PC 配有双 RTX 2080 Ti，通过 SMB 读取飞牛 NAS。第一阶段合成测试在 macOS 已通过。Windows BAT、实际共享目录及真实素材准确率待在 PC 验收，再进入 pHash、旋转和镜像阶段。
-- 后续 Web 集成需延续相对路径边界校验；旋转保留 mtime，原地替换成功后须失效查重缓存。扫描和相似度结果本身不触发任何视频写入或删除。验证使用合成文件或可丢弃测试副本。
+- Web 扫描延续相对路径边界校验。旋转和元数据编辑在替换文件后保留 mtime，并失效查重缓存。扫描和相似度结果本身不触发任何视频写入或删除。验证使用合成文件或可丢弃测试副本。
