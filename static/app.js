@@ -266,7 +266,7 @@ function renderFiles() {
     el.addEventListener("click", (e) => {
       if (boxSel.suppressClick) return;  // 框选结束后抑制误触的单击预览
       if (e.target.dataset.cb === undefined && e.target.type !== "checkbox")
-        selectFile(el.dataset.p);
+        selectFile(el.dataset.p, false, true);  // 再次点击取消勾选
     });
     const cb = el.querySelector('input[type=checkbox]');
     cb.addEventListener("click", (e) => e.stopPropagation());
@@ -452,16 +452,25 @@ function selectAllToggle() {
 
 /* ---------- 预览与元信息 ---------- */
 
-async function selectFile(path, force = false) {
+async function selectFile(path, force = false, toggleCheck = false) {
   const f = state.files.find((x) => x.path === path);
   if (!f) return;
+  const wasPreview = state.selectedFile?.path === path;  // 是否已在预览同一文件
   state.selectedFile = f;
-  state.checked.add(path);  // 点击列表/缩略图/任务输出即勾选当前文件
+  // 文件列表/缩略图点击：勾选状态取反（再次点击取消勾选）；其余调用点仍为追加勾选
+  if (toggleCheck) {
+    if (state.checked.has(path)) state.checked.delete(path);
+    else state.checked.add(path);
+  } else {
+    state.checked.add(path);
+  }
   $("previewTitle").textContent = "🎬 " + f.name;
   renderFiles();
   updateBatchCount();  // 同步工具栏、功能区与重命名预览的勾选状态
+  // 仅切换文件或 force 时重设 src，避免取消勾选同一文件时视频从头重播
   // force 时加时间戳破除浏览器视频缓存，确保看到替换/处理后的最新内容
-  $("player").src = `/api/stream?path=${encodeURIComponent(path)}${force ? `&t=${Date.now()}` : ""}`;
+  if (!wasPreview || force)
+    $("player").src = `/api/stream?path=${encodeURIComponent(path)}${force ? `&t=${Date.now()}` : ""}`;
 
   let info = {};
   try { info = await api(`/api/probe?path=${encodeURIComponent(path)}`); }
