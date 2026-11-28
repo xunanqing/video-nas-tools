@@ -133,6 +133,17 @@ async function pickRoot() {
   }
 }
 
+async function openCurrentDir() {
+  try {
+    const r = await api("/api/open-folder", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: state.currentDir }),
+    });
+    toast("已打开目录: " + r.path);
+  } catch (e) { toast("打开目录失败: " + e.message, true); }
+}
+
 /* ---------- 视频查重 ---------- */
 
 let dedupFolder = null;
@@ -929,6 +940,7 @@ function renderTasks(tasks) {
 /* ---------- 事件绑定 ---------- */
 
 $("rootSaveBtn").addEventListener("click", saveRoot);
+$("openDirBtn").addEventListener("click", openCurrentDir);
 $("rootInput").addEventListener("keydown", (e) => e.key === "Enter" && saveRoot());
 $("pickBtn").addEventListener("click", pickRoot);
 $("dedupBtn").addEventListener("click", openDedup);

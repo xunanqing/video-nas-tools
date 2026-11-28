@@ -247,6 +247,48 @@ def _run_picker(req: PickReq) -> str | None:
     return completed.stdout.rstrip("\r\n") or None
 
 
+# ---------- 在系统文件管理器中打开当前目录 ----------
+
+class OpenFolderReq(BaseModel):
+    path: str = ""
+
+
+def _open_in_file_manager(target: Path) -> None:
+    """跨 Windows / macOS / Linux 用系统默认文件管理器打开目录。"""
+    if sys.platform == "win32":
+        # os.startfile 对 UNC 网络路径同样有效；explorer 作为兜底
+        try:
+            os.startfile(str(target))  # noqa: S606
+        except OSError:
+            subprocess.run(["explorer", str(target)], check=True, timeout=15)
+    elif sys.platform == "darwin":
+        subprocess.run(["open", str(target)], check=True, timeout=15)
+    else:
+        # Linux：优先 xdg-open，其次 gio，最后尝试 nautilus/dolphin/thunar
+        for cmd in (["xdg-open"], ["gio", "open"], ["nautilus"], ["dolphin"], ["thunar"]):
+            try:
+                subprocess.run(cmd + [str(target)], check=True, timeout=15,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            except FileNotFoundError:
+                continue
+        raise RuntimeError("未找到可用的文件管理器（xdg-open / gio / nautilus / dolphin / thunar）")
+
+
+@app.post("/api/open-folder")
+async def open_folder(req: OpenFolderReq):
+    """在运行服务的桌面上打开文件管理器并定位到当前目录。"""
+    target = safe_resolve(req.path)
+    if not target.is_dir():
+        raise HTTPException(404, "目录不存在")
+    try:
+        await asyncio.to_thread(_open_in_file_manager, target)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("打开目录失败 %s: %s", target, exc)
+        raise HTTPException(500, f"无法打开目录: {exc}") from exc
+    return {"path": str(target)}
+
+
 # ---------- 视频查重 ----------
 
 class DedupReq(BaseModel):
