@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -20,15 +21,19 @@ from pydantic import BaseModel, Field
 
 from . import ffmpeg_service as ff
 from . import tag_store
-from .config import (BASE_DIR, DEFAULT_ROOT, MIME_MAP, VIDEO_EXTS, get_root,
-                     load_settings, set_root)
+from .config import (BASE_DIR, MIME_MAP, VIDEO_EXTS, get_preferences,
+                     get_root, load_settings, media_tools, save_settings, set_ffmpeg_dir,
+                     set_root, validate_ffmpeg_dir, validate_local_directory)
 from .dedup.media import DecodeMode
-from .dedup.web import invalidate_features, scan_folder
-from .task_queue import TaskQueue
+from .dedup.review import Review
+from .dedup.web import DISPLAY_LIMIT, invalidate_features, scan_folder
+from .task_queue import TaskQueue, TaskStatus
 
 app = FastAPI(title="Video NAS Tools")
 queue = TaskQueue(workers=2)
+pending_outputs: set[Path] = set()
 dedup_lock = asyncio.Lock()
+dedup_review: tuple[str, Review] | None = None
 picker_lock = asyncio.Lock()
 CHUNK_SIZE = 1024 * 1024
 LOGGER = logging.getLogger(__name__)
@@ -55,11 +60,11 @@ def safe_resolve(rel: str) -> Path:
 
 def unique_output(p: Path) -> Path:
     """输出文件已存在时自动加序号，避免覆盖。"""
-    if not p.exists():
+    if not (p.exists() or p.is_symlink() or p in pending_outputs):
         return p
     for i in range(1, 999):
         cand = p.with_name(f"{p.stem}_{i}{p.suffix}")
-        if not cand.exists():
+        if not (cand.exists() or cand.is_symlink() or cand in pending_outputs):
             return cand
     raise HTTPException(409, "输出文件冲突过多")
 
@@ -83,7 +88,14 @@ async def index():
 
 @app.get("/api/settings")
 async def read_settings():
-    return {"root": str(get_root()), "native_folder_picker": sys.platform in {"win32", "darwin"}}
+    preferences = get_preferences()
+    return {
+        "root": str(get_root()),
+        "native_folder_picker": sys.platform in {"win32", "darwin"},
+        "video_extensions": sorted(VIDEO_EXTS),
+        "ffmpeg_dir": preferences["ffmpeg_dir"],
+        "preferences": preferences,
+    }
 
 
 class SettingsReq(BaseModel):
@@ -97,6 +109,75 @@ async def update_settings(req: SettingsReq):
     except NotADirectoryError as e:
         raise HTTPException(400, str(e))
     return {"root": str(root)}
+
+
+class FFmpegSettingsReq(BaseModel):
+    ffmpeg_dir: str
+
+
+@app.post("/api/settings/ffmpeg")
+async def update_ffmpeg_settings(req: FFmpegSettingsReq, content_type: str = Header()):
+    if content_type.partition(";")[0].strip().lower() != "application/json":
+        raise HTTPException(415, "请使用 JSON 提交配置")
+    try:
+        directory = set_ffmpeg_dir(req.ffmpeg_dir)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except OSError as exc:
+        LOGGER.warning("保存 FFmpeg 目录失败: %s", exc)
+        raise HTTPException(500, "无法保存 FFmpeg 配置，请检查服务端目录权限") from exc
+    return {"ffmpeg_dir": directory}
+
+
+class PreferencesReq(BaseModel):
+    ffmpeg_dir: str
+    dedup_threshold: float = Field(ge=0, le=1)
+    dedup_decode_mode: DecodeMode
+    dedup_exact_only: bool
+    dedup_excluded_dirs: list[str]
+    dedup_workers: int = Field(ge=1, le=8)
+    processing_workers: int = Field(ge=1, le=8)
+    output_dir: str
+    cache_dir: str
+
+
+def normalize_exclusions(rules: list[str]) -> list[str]:
+    exclusions = []
+    for rule in rules:
+        value = rule.strip()
+        if not value:
+            continue
+        path = Path(value).expanduser()
+        if path.is_absolute():
+            exclusions.append(str(path.resolve()))
+        elif value not in (".", "..") and "/" not in value and "\\" not in value:
+            exclusions.append(value)
+        else:
+            raise ValueError(f"排除目录请填写单个目录名或绝对路径：{value}")
+    return list(dict.fromkeys(exclusions))
+
+
+@app.post("/api/settings/preferences")
+async def update_preferences(req: PreferencesReq, content_type: str = Header()):
+    if content_type.partition(";")[0].strip().lower() != "application/json":
+        raise HTTPException(415, "请使用 JSON 提交配置")
+    previous = get_preferences()
+    preferences = dict(req)
+    try:
+        if req.ffmpeg_dir != previous["ffmpeg_dir"]:
+            preferences["ffmpeg_dir"] = validate_ffmpeg_dir(req.ffmpeg_dir)
+        for key, label in (("output_dir", "输出目录"), ("cache_dir", "缓存目录")):
+            if preferences[key] != previous[key]:
+                preferences[key] = validate_local_directory(preferences[key], label, writable=True)
+        preferences["dedup_excluded_dirs"] = normalize_exclusions(req.dedup_excluded_dirs)
+        save_settings({**load_settings(), **preferences})
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except OSError as exc:
+        LOGGER.warning("保存配置失败: %s", exc)
+        raise HTTPException(500, "无法保存配置，请检查服务端目录权限") from exc
+    await queue.set_workers(req.processing_workers)
+    return {"preferences": preferences}
 
 
 # ---------- 原生目录选择 ----------
@@ -176,7 +257,7 @@ public class PickerTop {
 "@
 $d = New-Object System.Windows.Forms.FolderBrowserDialog
 $d.ShowNewFolderButton = $false;
-$d.Description = '选择 NAS 视频根目录'
+$d.Description = '选择文件夹'
 if ($env:VIDEO_NAS_PICKER_INITIAL) { $d.SelectedPath = $env:VIDEO_NAS_PICKER_INITIAL }
 [PickerTop]::Start([uint32][System.Diagnostics.Process]::GetCurrentProcess().Id)
 $result = $d.ShowDialog()
@@ -188,7 +269,7 @@ _MAC_PICK = """
 on run argv
     try
         activate
-        set folderPrompt to "选择 NAS 视频根目录"
+        set folderPrompt to "选择文件夹"
         if (count of argv) > 0 then
             set initialFolder to POSIX file (item 1 of argv) as alias
             set selectedFolder to choose folder with prompt folderPrompt default location initialFolder
@@ -293,23 +374,55 @@ async def open_folder(req: OpenFolderReq):
 
 class DedupReq(BaseModel):
     path: str = ""
-    threshold: float = Field(default=0.96, ge=0, le=1)
-    exact_only: bool = False
-    decode_mode: DecodeMode = "auto"
+    threshold: float | None = Field(default=None, ge=0, le=1)
+    exact_only: bool | None = None
+    decode_mode: DecodeMode | None = None
 
 
 @app.post("/api/dedup/scan")
 async def dedup_scan(req: DedupReq):
+    global dedup_review
+    root = get_root().resolve()
     folder = safe_resolve(req.path)
     if not folder.is_dir():
         raise HTTPException(404, "扫描目录不存在")
     if dedup_lock.locked():
         raise HTTPException(409, "已有查重扫描正在运行")
     async with dedup_lock:
+        prefs = get_preferences()
         try:
-            return await asyncio.to_thread(scan_folder, folder, req.threshold, req.exact_only, req.decode_mode)
+            result, review = await asyncio.to_thread(
+                scan_folder, root, folder,
+                prefs["dedup_threshold"] if req.threshold is None else req.threshold,
+                prefs["dedup_exact_only"] if req.exact_only is None else req.exact_only,
+                req.decode_mode or prefs["dedup_decode_mode"],
+                excluded_dirs=tuple(prefs["dedup_excluded_dirs"]), workers=prefs["dedup_workers"],
+            )
         except (OSError, sqlite3.Error) as exc:
             raise HTTPException(503, str(exc)) from exc
+        review_id = uuid.uuid4().hex
+        dedup_review = (review_id, review)
+        return {**result, "review_id": review_id}
+
+
+class DedupTrashReq(BaseModel):
+    review_id: str
+    paths: list[str] = Field(min_length=1, max_length=DISPLAY_LIMIT ** 2)
+
+
+@app.post("/api/dedup/trash")
+async def trash_duplicates(req: DedupTrashReq):
+    from send2trash import send2trash
+
+    if dedup_lock.locked():
+        raise HTTPException(409, "查重任务正在运行，请稍后再试")
+    async with dedup_lock:
+        if not dedup_review or req.review_id != dedup_review[0] or dedup_review[1].root != get_root().resolve():
+            raise HTTPException(409, "查重结果已过期，请重新扫描")
+        try:
+            return await asyncio.to_thread(dedup_review[1].move_to_trash, req.paths, send2trash)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
 
 # ---------- 批量删除（移入回收站） ----------
@@ -430,8 +543,8 @@ async def list_files(path: str = Query("")):
             if item.is_dir():
                 dirs.append({"name": item.name, "path": rel_posix(item)})
             elif item.suffix.lower() in VIDEO_EXTS and item.is_file():
-                if ".rot_tmp_" in item.name:
-                    continue  # 旋转任务运行中的临时文件
+                if ".rot_tmp_" in item.name or item.name.startswith(".output_tmp_"):
+                    continue
                 st = item.stat()
                 files.append({
                     "name": item.name,
@@ -457,7 +570,12 @@ def thumb_prefix(p: Path) -> str:
 
 def thumb_file(p: Path) -> Path:
     st = p.stat()
-    return THUMB_DIR / f"{thumb_prefix(p)}_{int(st.st_mtime * 1000)}_{st.st_size}.jpg"
+    return thumbnail_directory() / f"{thumb_prefix(p)}_{st.st_mtime_ns}_{st.st_ctime_ns}_{st.st_size}.jpg"
+
+
+def thumbnail_directory() -> Path:
+    directory = load_settings().get("cache_dir")
+    return Path(directory) / "thumbnails" if directory else THUMB_DIR
 
 
 def invalidate_thumbnail(p: Path) -> None:
@@ -467,7 +585,7 @@ def invalidate_thumbnail(p: Path) -> None:
     因此必须在替换完成后主动失效。
     """
     prefix = thumb_prefix(p) + "_"
-    for cached in THUMB_DIR.glob(prefix + "*.jpg"):
+    for cached in thumbnail_directory().glob(prefix + "*.jpg"):
         try:
             cached.unlink()
         except OSError:
@@ -489,14 +607,24 @@ async def thumbnail(path: str):
     p = require_video(safe_resolve(path))
     out = thumb_file(p)
     if not out.exists():
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-ss", "1", "-i", str(p), "-frames:v", "1",
-            "-vf", "scale=240:-2", "-q:v", "5", str(out),
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-        _, err = await proc.communicate()
-        if proc.returncode != 0 or not out.exists():
-            raise HTTPException(500, f"缩略图生成失败: {err.decode(errors='replace')[:200]}")
+        out.parent.mkdir(exist_ok=True)
+        temp = out.with_name(f"{out.stem}-{uuid.uuid4().hex}.jpg")
+        try:
+            for position in ("1", "0"):
+                proc = await asyncio.create_subprocess_exec(
+                    media_tools()[0], "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    "-ss", position, "-i", str(p), "-map", "0:V:0", "-frames:v", "1",
+                    "-vf", "scale=240:-2", "-q:v", "5", str(temp),
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+                _, err = await proc.communicate()
+                if proc.returncode == 0 and temp.is_file() and temp.stat().st_size:
+                    temp.replace(out)
+                    break
+                temp.unlink(missing_ok=True)
+            else:
+                raise HTTPException(500, f"缩略图生成失败: {err.decode(errors='replace')[:200]}")
+        finally:
+            temp.unlink(missing_ok=True)
     return FileResponse(out, media_type="image/jpeg",
                         headers={"Cache-Control": "public, max-age=86400"})
 
@@ -720,52 +848,44 @@ async def run_detection(req: DetectReq):
 @app.get("/api/stream")
 async def stream(path: str, range_: Optional[str] = Header(None, alias="Range")):
     p = require_video(safe_resolve(path))
+    return video_stream(p, range_)
+
+
+def video_stream(p: Path, range_: str | None):
     mime = MIME_MAP.get(p.suffix.lower(), "application/octet-stream")
     size = p.stat().st_size
+    start, end, status = 0, size - 1, 200
+    headers = {"Accept-Ranges": "bytes"}
 
     if range_:
-        m = re.match(r"bytes=(\d*)-(\d*)", range_.strip())
-        if m:
-            start = int(m.group(1) or 0)
-            end = int(m.group(2)) if m.group(2) else size - 1
-            end = min(end, size - 1)
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_.strip())
+        if match and (match[1] or match[2]):
+            if match[1]:
+                start = int(match[1])
+                if match[2]:
+                    end = min(int(match[2]), size - 1)
+            else:
+                start = max(0, size - int(match[2]))
             if start > end or start >= size:
                 return StreamingResponse(iter([]), status_code=416, headers={
                     "Content-Range": f"bytes */{size}"})
-            length = end - start + 1
+            status = 206
+            headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    headers["Content-Length"] = str(end - start + 1)
 
-            def iter_file():
-                # 每块单独 open/close：长时间暂停播放时不会一直占用文件句柄，
-                # 否则 Windows 上旋转任务无法覆盖该文件（WinError 5）
-                offset, remaining = start, length
-                while remaining > 0:
-                    with open(p, "rb") as f:
-                        f.seek(offset)
-                        chunk = f.read(min(CHUNK_SIZE, remaining))
-                    if not chunk:
-                        break
-                    offset += len(chunk)
-                    remaining -= len(chunk)
-                    yield chunk
+    def iter_file():
+        # 每次读完一块就关闭句柄，避免在 Windows 上长时间占用文件。
+        offset = start
+        while offset <= end:
+            with p.open("rb") as f:
+                f.seek(offset)
+                chunk = f.read(min(CHUNK_SIZE, end - offset + 1))
+            if not chunk:
+                break
+            offset += len(chunk)
+            yield chunk
 
-            return StreamingResponse(iter_file(), status_code=206,
-                media_type=mime,
-                headers={"Content-Range": f"bytes {start}-{end}/{size}",
-                         "Accept-Ranges": "bytes"})
-
-        def iter_full():
-            offset = 0
-            while offset < size:
-                with open(p, "rb") as f:
-                    f.seek(offset)
-                    chunk = f.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                offset += len(chunk)
-                yield chunk
-
-        return StreamingResponse(iter_full(), media_type=mime,
-                                 headers={"Accept-Ranges": "bytes"})
+    return StreamingResponse(iter_file(), status_code=status, media_type=mime, headers=headers)
 
 
 # ---------- 任务提交 ----------
@@ -796,17 +916,51 @@ async def submit_cut(rel: str, start: float, end: float, lossless: bool):
     src = require_video(safe_resolve(rel))
     if end <= start:
         raise HTTPException(400, "结束时间必须大于开始时间")
-    out = unique_output(src.with_name(
-        f"{src.stem}_cut_{start:.1f}-{end:.1f}{src.suffix}"))
     duration = (await ff.probe(src))["duration"]
 
-    async def job(on_progress):
+    async def job(out, on_progress):
         await ff.run_ffmpeg(
             ff.build_cut_args(src, out, start, end, lossless),
             duration, on_progress)
 
-    return await queue.submit(
-        "cut", f"截取 {src.name}", rel, rel_posix(out), job)
+    return await submit_output_task(
+        "cut", f"截取 {src.name}", rel,
+        src.with_name(f"{src.stem}_cut_{start:.1f}-{end:.1f}{src.suffix}"), job)
+
+
+async def submit_output_task(kind, title, source, default_path, write, sources=None):
+    directory = load_settings().get("output_dir")
+    folder = Path(directory) if directory else default_path.parent
+    if not folder.is_dir():
+        raise HTTPException(400, "输出目录不存在，请检查配置")
+    out = unique_output(folder.resolve() / default_path.name)
+    root = get_root().resolve()
+    external = not out.is_relative_to(root)
+    pending_outputs.add(out)
+
+    async def job(on_progress):
+        temporary = out.with_name(f".output_tmp_{uuid.uuid4().hex}{out.suffix}")
+        try:
+            await write(temporary, on_progress)
+            # 独占创建可防止任务执行期间出现的同名文件被覆盖。
+            with out.open("xb"):
+                pass
+            try:
+                temporary.replace(out)
+            except OSError:
+                out.unlink(missing_ok=True)
+                raise
+        finally:
+            pending_outputs.discard(out)
+            temporary.unlink(missing_ok=True)
+
+    try:
+        return await queue.submit(
+            kind, title, source, str(out) if external else out.relative_to(root).as_posix(),
+            job, sources=sources, external_output=out if external else None)
+    except BaseException:
+        pending_outputs.discard(out)
+        raise
 
 
 _file_locks: dict = {}
@@ -929,12 +1083,11 @@ async def concat_videos(req: ConcatReq):
             raise HTTPException(400, "输出文件名无效")
     else:
         name = f"{first.stem}_拼接"
-    out = unique_output(first.with_name(name + first.suffix.lower()))
+    output_name = name + first.suffix.lower()
     total_duration = sum(i["duration"] for i in infos)
 
-    list_path = first.with_name(f".concat_{uuid.uuid4().hex[:8]}.txt")
-
-    async def job(on_progress):
+    async def job(out, on_progress):
+        list_path = out.with_name(f".concat_{uuid.uuid4().hex[:8]}.txt")
         try:
             if req.mode == "copy":
                 list_path.write_text(ff.concat_list_text(sources), encoding="utf-8")
@@ -945,9 +1098,9 @@ async def concat_videos(req: ConcatReq):
         finally:
             list_path.unlink(missing_ok=True)
 
-    task = await queue.submit(
-        "concat", f"拼接 {len(sources)} 个视频 → {out.name}",
-        req.paths[0], rel_posix(out), job, sources=req.paths)
+    task = await submit_output_task(
+        "concat", f"拼接 {len(sources)} 个视频 → {output_name}",
+        req.paths[0], first.with_name(output_name), job, sources=req.paths)
     return {"taskId": task.id, "status": task.status, "output": task.output}
 
 
@@ -955,9 +1108,21 @@ async def concat_videos(req: ConcatReq):
 async def tasks():
     return {"tasks": [
         {"id": t.id, "kind": t.kind, "title": t.title, "source": t.source,
-         "output": t.output, "sources": t.sources, "status": t.status,
+         "output": t.output, "external_output": t.external_output is not None,
+         "sources": t.sources, "status": t.status,
          "progress": round(t.progress, 3), "error": t.error}
         for t in queue.list()]}
+
+
+@app.get("/api/tasks/{task_id}/output")
+async def task_output(task_id: str, range_: Optional[str] = Header(None, alias="Range")):
+    task = queue.get(task_id)
+    if not task or task.status != TaskStatus.DONE or task.external_output is None:
+        raise HTTPException(404, "任务输出不存在")
+    output = task.external_output
+    if output.resolve() != output:
+        raise HTTPException(404, "任务输出路径已变化")
+    return video_stream(require_video(output), range_)
 
 
 @app.delete("/api/tasks")
@@ -970,16 +1135,10 @@ async def clear_tasks():
 
 @app.on_event("startup")
 async def on_startup():
+    await queue.set_workers(get_preferences()["processing_workers"])
     root = get_root()
     if not load_settings().get("root"):
         print(f"[i] 未配置根目录，默认使用: {root}（可通过设置页修改）")
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-version",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        await proc.wait()
-        if proc.returncode != 0:
-            raise RuntimeError
-    except Exception:  # noqa: BLE001
-        print("[!] 警告: ffmpeg 不在 PATH 中，视频处理将不可用。"
-              "可通过环境变量 FFMPEG_PATH 指定路径。")
+    for binary in media_tools():
+        if not shutil.which(binary):
+            print(f"[!] 找不到 {binary}，请在「配置」中设置 FFmpeg 目录。")

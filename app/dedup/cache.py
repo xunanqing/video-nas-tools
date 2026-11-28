@@ -9,11 +9,15 @@ class VideoFile:
     size: int
     mtime_ns: int
     ctime_ns: int
+    device: int = 0
+    inode: int = 0
+    birthtime: float | None = None
 
     @classmethod
     def read(cls, path: Path) -> "VideoFile":
         stat = path.stat()
-        return cls(path, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        return cls(path, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
+                   stat.st_dev, stat.st_ino, getattr(stat, "st_birthtime", None))
 
     def verify(self) -> None:
         if self != self.read(self.path):

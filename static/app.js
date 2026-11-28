@@ -5,9 +5,12 @@ const $ = (id) => document.getElementById(id);
 const state = {
   root: "",
   nativeFolderPicker: true,
+  preferences: null,
   currentDir: "",
   parentDir: null,
+  directoryFiles: [],
   files: [],           // {name, path, size, mtime}
+  hiddenVideoExtensions: new Set((localStorage.getItem("hiddenVideoExtensions") || "").split(",").filter(Boolean)),
   dirs: [],
   selectedFile: null,  // 当前播放的文件对象
   checked: new Set(),  // 勾选的文件 path
@@ -26,7 +29,7 @@ let selBoxEl = null;  // 框选矩形（renderFiles 重建 DOM 后需重新挂�
 function fmtSize(bytes) {
   if (bytes >= 1 << 30) return (bytes / (1 << 30)).toFixed(2) + " GB";
   if (bytes >= 1 << 20) return (bytes / (1 << 20)).toFixed(1) + " MB";
-  if (bytes >= 1 << 10) return (bytes / 1 << 10).toFixed(0) + " KB";
+  if (bytes >= 1 << 10) return (bytes / (1 << 10)).toFixed(0) + " KB";
   return bytes + " B";
 }
 
@@ -75,10 +78,21 @@ function esc(s) {
 
 async function loadSettings() {
   try {
-    const { root, native_folder_picker } = await api("/api/settings");
+    const { root, native_folder_picker, video_extensions, preferences } = await api("/api/settings");
     state.root = root;
     state.nativeFolderPicker = native_folder_picker;
+    state.preferences = preferences;
+    document.querySelectorAll("[data-config-picker]").forEach((button) => {
+      button.hidden = !native_folder_picker;
+    });
+    applyDedupDefaults();
     $("rootInput").value = root;
+    if (Array.isArray(video_extensions)) {
+      $("fileExtensionOptions").innerHTML = video_extensions.map((extension) =>
+        `<label><input type="checkbox" value="${esc(extension)}"> ${esc(extension)}</label>`
+      ).join("");
+      $("fileConfigBtn").disabled = !preferences;
+    }
     if (!native_folder_picker) {
       $("rootInput").placeholder = "服务端视频目录，如 /media/videos";
       $("pickBtn").textContent = "输入路径";
@@ -99,11 +113,21 @@ async function saveRoot() {
     state.currentDir = "";
     state.checked.clear();
     state.selectedFile = null;
-    stopPlayer();
+    if (dedupActive) closeDedup();
+    else stopPlayer();
     await browse("");
     updateWorkspace();
     toast("根目录已保存: " + root);
   } catch (e) { toast(e.message, true); }
+}
+
+async function pickFolder(initial) {
+  const { path } = await api("/api/pick-folder", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ initial: initial.trim() }),
+  });
+  return path;
 }
 
 async function pickRoot() {
@@ -117,11 +141,7 @@ async function pickRoot() {
   btn.disabled = true;
   btn.textContent = "⏳ 选择中...";
   try {
-    const { path } = await api("/api/pick-folder", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ initial: $("rootInput").value.trim() }),
-    });
+    const path = await pickFolder($("rootInput").value);
     if (!path) { toast("已取消选择"); return; }
     $("rootInput").value = path;
     await saveRoot();
@@ -147,66 +167,329 @@ async function openCurrentDir() {
 /* ---------- 视频查重 ---------- */
 
 let dedupFolder = null;
+let dedupReview = null;
+let dedupActive = false;
+let dedupPreview = null;
+let dedupShowPreview = true;
+let libraryPreviewTime = 0;
+const dedupChecked = new Set();
+
+function updateDedupControls() {
+  const exactOnly = $("dedupExactOnly").checked;
+  $("dedupThreshold").disabled = exactOnly;
+  $("dedupDecodeMode").disabled = exactOnly;
+}
+
+function applyDedupDefaults() {
+  const preferences = state.preferences;
+  if (!preferences) return;
+  $("dedupThreshold").value = Number((preferences.dedup_threshold * 100).toFixed(1));
+  $("dedupDecodeMode").value = preferences.dedup_decode_mode;
+  $("dedupExactOnly").checked = preferences.dedup_exact_only;
+  updateDedupControls();
+}
 
 function openDedup() {
+  if (dedupActive) {
+    closeDedup();
+    return;
+  }
   const label = state.currentDir ? `${state.root} / ${state.currentDir}` : state.root;
-  if (!$("dedupScanBtn").disabled && dedupFolder?.label !== label) {
-    dedupFolder = { path: state.currentDir, label };
+  if (dedupFolder?.root !== state.root || dedupFolder?.path !== state.currentDir) {
+    if ($("dedupScanBtn").disabled) return toast("查重正在处理上一个目录，请稍候");
+    dedupFolder = { root: state.root, path: state.currentDir };
     $("dedupFolder").textContent = label;
     $("dedupStatus").textContent = "";
-    $("dedupResults").replaceChildren();
+    resetDedupResults();
   }
-  $("dedupDialog").showModal();
+  libraryPreviewTime = $("player").currentTime;
+  $("player").pause();
+  setDedupView(true);
+  if (dedupPreview) showVideoPreview(dedupPreview);
+  else stopPlayer();
+  ($("dedupScanBtn").disabled ? $("dedupCloseBtn") : $("dedupScanBtn")).focus();
+}
+
+function closeDedup() {
+  $("player").pause();
+  setDedupView(false);
+  if (state.selectedFile) showVideoPreview(state.selectedFile, false, libraryPreviewTime);
+  else stopPlayer();
+  $("dedupBtn").focus();
+}
+
+function setDedupView(active) {
+  dedupActive = active;
+  $("dedupPanel").hidden = !active;
+  $("libraryControls").hidden = active;
+  $("fileList").hidden = active;
+  $("dedupBtn").setAttribute("aria-expanded", String(active));
+  updatePreviewToggleBtn();
+  updateWorkspace();
+}
+
+function selectDedupPreview(relativePath) {
+  const info = dedupReview?.files[relativePath];
+  if (!dedupActive || !info || $("dedupScanBtn").disabled) return;
+  dedupPreview = { path: info.path, name: relativePath, size: info.size };
+  dedupShowPreview = true;
+  updateDedupPreview();
+  showVideoPreview(dedupPreview);
+}
+
+function updateDedupPreview() {
+  for (const button of $("dedupResults").querySelectorAll("[data-preview-path]")) {
+    button.setAttribute("aria-current", String(button.dataset.previewPath === dedupPreview?.name));
+  }
+  updatePreviewToggleBtn();
+  updateWorkspace();
 }
 
 async function startDedup(event) {
   event.preventDefault();
   const button = $("dedupScanBtn");
   if (button.disabled || !dedupFolder) return;
+  const folder = dedupFolder;
   const status = $("dedupStatus");
-  const results = $("dedupResults");
   button.disabled = true;
   status.textContent = "正在扫描…";
-  results.replaceChildren();
+  resetDedupResults();
   try {
-    const request = { path: dedupFolder.path, exact_only: $("dedupExactOnly").checked };
+    const request = { path: folder.path, exact_only: $("dedupExactOnly").checked };
     if (!request.exact_only) {
       request.threshold = $("dedupThreshold").valueAsNumber / 100;
       request.decode_mode = $("dedupDecodeMode").value;
     }
-    const { summary, matches } = await api("/api/dedup/scan", {
+    const review = await api("/api/dedup/scan", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(request),
     });
+    if (state.root !== folder.root) return;
+    dedupReview = review;
+    const { summary, matches, selected } = dedupReview;
     const total = summary.exact_groups + summary.visual_pairs;
-    status.textContent = `已扫描 ${summary.files} 个视频，找到 ${summary.exact_groups} 组完全相同、${summary.visual_pairs} 对内容相似`
+    selected.forEach((path) => dedupChecked.add(path));
+    const groupCount = renderDedupResults();
+    status.textContent = `已扫描 ${summary.files} 个视频，展示 ${groupCount} 组重复结果`
       + (summary.errors ? `，${summary.errors} 项读取失败` : "")
-      + (matches.length < total ? `。显示前 ${matches.length} 条` : "。");
-    for (const match of matches) {
-      const row = document.createElement("li");
-      const heading = document.createElement("strong");
-      heading.textContent = match.type === "exact"
-        ? `完全相同 · ${match.path_count} 个文件`
-        : `相似度 ${(match.similarity * 100).toFixed(1)}%`;
-      const paths = document.createElement("ul");
-      for (const path of match.paths) {
-        const item = document.createElement("li");
-        item.textContent = path;
-        paths.append(item);
-      }
-      if (match.paths.length < match.path_count) {
-        const rest = document.createElement("li");
-        rest.textContent = `另有 ${match.path_count - match.paths.length} 个文件`;
-        paths.append(rest);
-      }
-      row.append(heading, paths);
-      results.append(row);
-    }
+      + (matches.length < total ? `。当前展示 ${matches.length} 条匹配依据，共找到 ${total} 条。` : "。");
   } catch (e) {
     status.textContent = `扫描失败：${e.message}`;
   } finally {
     button.disabled = false;
+    updateDedupSelection();
+  }
+}
+
+function resetDedupResults() {
+  dedupReview = null;
+  dedupPreview = null;
+  dedupChecked.clear();
+  $("dedupActions").hidden = true;
+  $("dedupFeedback").textContent = "";
+  $("dedupResults").replaceChildren();
+  if (dedupActive) {
+    stopPlayer();
+    updateWorkspace();
+  }
+}
+
+function groupDedupMatches(matches) {
+  // A file appears once per group. Keep the underlying matches for cleanup validation.
+  const byFile = new Map();
+  for (const match of matches) {
+    for (const path of match.paths) {
+      if (!byFile.has(path)) byFile.set(path, []);
+      byFile.get(path).push(match);
+    }
+  }
+
+  const unvisited = new Set(matches);
+  const groups = [];
+  for (const first of matches) {
+    if (!unvisited.delete(first)) continue;
+    const evidence = [first];
+    const paths = new Set();
+    for (let index = 0; index < evidence.length; index++) {
+      for (const path of evidence[index].paths) {
+        if (paths.has(path)) continue;
+        paths.add(path);
+        for (const related of byFile.get(path)) {
+          if (unvisited.delete(related)) evidence.push(related);
+        }
+      }
+    }
+    groups.push({ paths: [...paths], evidence });
+  }
+  return groups;
+}
+
+function formatDedupSimilarity(value) {
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+function renderDedupResults() {
+  const results = $("dedupResults");
+  results.replaceChildren();
+  const suggested = new Set(dedupReview.selected);
+  const groups = groupDedupMatches(dedupReview.matches);
+  groups.forEach(({ paths, evidence }, index) => {
+    const row = document.createElement("li");
+    const visual = evidence.filter((match) => match.type === "visual");
+    const heading = document.createElement("h3");
+    heading.className = "dedup-group-heading";
+    heading.textContent = `第 ${index + 1} 组 · ${visual.length ? "内容相似" : "完全相同"} · ${paths.length} 个视频`;
+    row.append(heading);
+
+    if (visual.length) {
+      const similarities = visual.map((match) => match.similarity);
+      const low = formatDedupSimilarity(Math.min(...similarities));
+      const high = formatDedupSimilarity(Math.max(...similarities));
+      const details = document.createElement("details");
+      details.className = "dedup-evidence";
+      const summary = document.createElement("summary");
+      summary.textContent = `直接相似度 ${low === high ? low : `${low}–${high}`} · 查看匹配依据`;
+      const list = document.createElement("ul");
+      for (const match of evidence) {
+        const item = document.createElement("li");
+        const label = match.type === "exact" ? "完全相同" : formatDedupSimilarity(match.similarity);
+        item.textContent = `${label} · ${match.paths.join("、")}`;
+        list.append(item);
+      }
+      details.append(summary, list);
+      row.append(details);
+    }
+
+    const files = document.createElement("ul");
+    files.className = "dedup-group-files";
+    paths.sort((a, b) => Number(suggested.has(a)) - Number(suggested.has(b)));
+    for (const path of paths) {
+      const info = dedupReview.files[path];
+      const item = document.createElement("li");
+      item.className = "dedup-file";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.dataset.path = path;
+      checkbox.setAttribute("aria-label", `选中 ${path} 移入回收站`);
+
+      const preview = document.createElement("button");
+      preview.type = "button";
+      preview.className = "dedup-preview";
+      preview.dataset.previewPath = path;
+      preview.setAttribute("aria-label", `预览 ${path}`);
+      preview.setAttribute("aria-current", String(dedupPreview?.name === path));
+
+      const cover = document.createElement("span");
+      cover.className = "dedup-cover";
+      const image = document.createElement("img");
+      image.alt = "";
+      image.loading = "lazy";
+      image.src = `/api/thumbnail?path=${encodeURIComponent(info.path)}&v=${info.thumbnail_version}`;
+      image.addEventListener("error", () => { cover.textContent = "无缩略图"; }, { once: true });
+      cover.append(image);
+
+      const details = document.createElement("span");
+      const name = document.createElement("strong");
+      name.textContent = path;
+      if (!suggested.has(path)) {
+        const badge = document.createElement("span");
+        badge.className = "dedup-keep";
+        badge.textContent = "推荐保留";
+        name.append(" ", badge);
+      }
+      const properties = document.createElement("span");
+      properties.className = "dedup-properties";
+      const specs = [];
+      if (info.width && info.height) specs.push(`${info.width}×${info.height}`);
+      if (info.duration) specs.push(fmtTime(info.duration));
+      if (info.bitrate) specs.push(`${Math.round(info.bitrate / 1000)} kb/s`);
+      specs.push(fmtSize(info.size));
+      properties.textContent = specs.join(" · ");
+      const date = document.createElement("span");
+      date.className = "dedup-properties";
+      const source = { metadata: "视频创建", birth: "文件创建", modified: "文件修改" }[info.time_source];
+      date.textContent = `${source} ${new Date(info.original_time * 1000).toLocaleString("zh-CN", { hour12: false })}`;
+      details.append(name, properties, date);
+      preview.append(cover, details);
+      item.append(checkbox, preview);
+      files.append(item);
+    }
+    row.append(files);
+    if (evidence.some((match) => match.paths.length < match.path_count)) {
+      const rest = document.createElement("p");
+      rest.className = "dedup-properties";
+      rest.textContent = "部分完全相同的视频未展开。";
+      row.append(rest);
+    }
+    results.append(row);
+  });
+  $("dedupActions").hidden = !groups.length;
+  updateDedupSelection();
+  return groups.length;
+}
+
+function updateDedupSelection() {
+  if (!dedupReview) return;
+  const busy = $("dedupScanBtn").disabled;
+  for (const checkbox of $("dedupResults").querySelectorAll("input[data-path]")) {
+    checkbox.checked = dedupChecked.has(checkbox.dataset.path);
+    checkbox.disabled = busy;
+  }
+  for (const preview of $("dedupResults").querySelectorAll("[data-preview-path]")) preview.disabled = busy;
+  const safe = new Set();
+  for (const { paths } of dedupReview.matches) {
+    if (paths.some((path) => !dedupChecked.has(path))) paths.forEach((path) => safe.add(path));
+  }
+  const missingKeeper = [...dedupChecked].some((path) => !safe.has(path));
+  $("dedupSelection").textContent = `已选 ${dedupChecked.size} 个文件`
+    + (missingKeeper ? "，请为每个待清理文件保留至少一个直接匹配项" : "");
+  $("dedupTrashBtn").disabled = !dedupChecked.size || missingKeeper || busy;
+}
+
+async function trashDuplicates() {
+  if (!dedupReview || $("dedupTrashBtn").disabled) return;
+  const paths = [...dedupChecked];
+  if (!confirm(`将选中的 ${paths.length} 个视频移入回收站？\n\n请核对选中的文件。网络位置可能无法从回收站恢复。`)) return;
+
+  $("dedupScanBtn").disabled = true;
+  updateDedupSelection();
+  if (paths.includes(dedupPreview?.name)) {
+    dedupPreview = null;
+    if (dedupActive) stopPlayer();
+    updateDedupPreview();
+  }
+  const feedback = $("dedupFeedback");
+  feedback.textContent = "正在移入回收站…";
+  try {
+    const { deleted_paths, errors } = await api("/api/dedup/trash", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ review_id: dedupReview.review_id, paths }),
+    });
+    const deleted = new Set(deleted_paths);
+    const remaining = new Set();
+    dedupReview.matches = dedupReview.matches.flatMap((match) => {
+      const paths = match.paths.filter((path) => !deleted.has(path));
+      if (paths.length < 2) return [];
+      paths.forEach((path) => remaining.add(path));
+      return [{ ...match, paths, path_count: match.path_count - (match.paths.length - paths.length) }];
+    });
+    for (const path of dedupChecked) {
+      if (!remaining.has(path)) dedupChecked.delete(path);
+    }
+    const groupCount = renderDedupResults();
+    if (deleted.size) {
+      $("dedupStatus").textContent = groupCount ? `剩余 ${groupCount} 组重复结果。` : "没有剩余的已展示匹配。";
+      await browse(state.currentDir);
+    }
+    feedback.textContent = `已移入回收站 ${deleted.size} 个视频`
+      + (errors.length ? `，${errors.length} 个失败。 ${errors[0]}` : "。");
+  } catch (e) {
+    feedback.textContent = `清理失败：${e.message}`;
+  } finally {
+    $("dedupScanBtn").disabled = false;
+    updateDedupSelection();
   }
 }
 
@@ -219,18 +502,27 @@ async function browse(path) {
     localStorage.setItem("lastDir", data.path);  // 刷新后恢复上次浏览目录
     state.parentDir = data.parent;
     state.dirs = data.dirs;
-    state.files = data.files;
-    // 剔除已不存在的勾选项
-    const names = new Set(data.files.map((f) => f.path));
-    [...state.checked].forEach((p) => { if (!names.has(p)) state.checked.delete(p); });
-    if (state.selectedFile && !names.has(state.selectedFile.path)) {
-      state.selectedFile = null;
-      stopPlayer();
-    }
+    state.directoryFiles = data.files;
     renderDirs();
-    renderFiles();
-    updateBatchCount();
+    applyFileExtensionFilter();
   } catch (e) { toast(e.message, true); }
+}
+
+function applyFileExtensionFilter() {
+  state.files = state.directoryFiles.filter((file) => {
+    const extension = file.name.slice(file.name.lastIndexOf(".")).toLowerCase();
+    return !state.hiddenVideoExtensions.has(extension);
+  });
+  const visiblePaths = new Set(state.files.map((file) => file.path));
+  for (const path of state.checked) {
+    if (!visiblePaths.has(path)) state.checked.delete(path);
+  }
+  if (state.selectedFile && !visiblePaths.has(state.selectedFile.path)) {
+    state.selectedFile = null;
+    if (!dedupActive) stopPlayer();
+  }
+  renderFiles();
+  updateBatchCount();
 }
 
 function renderDirs() {
@@ -431,17 +723,32 @@ function renderConcatList() {
 /* ---------- 右侧工作区显隐 ---------- */
 
 function updateWorkspace() {
+  if (dedupActive) {
+    const visible = !!dedupPreview && dedupShowPreview;
+    $("previewArea").hidden = !visible;
+    $("selectedPanel").hidden = true;
+    $("emptyState").hidden = visible;
+    $("emptyPreviewMessage").textContent = dedupShowPreview ? "点击左侧查重结果预览视频" : "视频预览已隐藏";
+    $("emptyPreviewHint").hidden = true;
+    return;
+  }
   const hasPreview = !!state.selectedFile;
   const hasChecked = state.checked.size > 0;
   $("previewArea").hidden = !hasPreview || !state.showPreview;
   $("selectedPanel").hidden = !hasChecked;
   $("emptyState").hidden = hasPreview || hasChecked;
+  $("emptyPreviewMessage").textContent = "从左侧选择一个视频文件开始预览";
+  $("emptyPreviewHint").hidden = false;
   // 勾选了文件但尚未预览时，提示可点击文件名预览
   $("previewHint").hidden = hasPreview || !hasChecked;
 }
 
+let previewRequest = 0;
+
 function stopPlayer() {
+  previewRequest++;
   const v = $("player");
+  delete v.dataset.previewPath;
   try { v.pause(); v.removeAttribute("src"); v.load(); } catch { /* ignore */ }
 }
 
@@ -468,8 +775,7 @@ function selectAllToggle() {
 
 async function selectFile(path, force = false, toggleCheck = false) {
   const f = state.files.find((x) => x.path === path);
-  if (!f) return;
-  const wasPreview = state.selectedFile?.path === path;  // 是否已在预览同一文件
+  if (!f || dedupActive) return;
   state.selectedFile = f;
   // 文件列表/缩略图点击：勾选状态取反（再次点击取消勾选）；其余调用点仍为追加勾选
   if (toggleCheck) {
@@ -478,29 +784,41 @@ async function selectFile(path, force = false, toggleCheck = false) {
   } else {
     state.checked.add(path);
   }
-  $("previewTitle").textContent = "🎬 " + f.name;
   renderFiles();
   updateBatchCount();  // 同步工具栏、功能区与重命名预览的勾选状态
-  // 仅切换文件或 force 时重设 src，避免取消勾选同一文件时视频从头重播
-  // force 时加时间戳破除浏览器视频缓存，确保看到替换/处理后的最新内容
-  if (!wasPreview || force)
-    $("player").src = `/api/stream?path=${encodeURIComponent(path)}${force ? `&t=${Date.now()}` : ""}`;
+  const current = await showVideoPreview(f, force);
+  if (!current || dedupActive) return;
+  if (currentOp() === "detect") loadDetectResult();
+  if (currentOp() === "meta") loadMetadata();
+}
+
+async function showVideoPreview(file, force = false, position = null) {
+  const request = ++previewRequest;
+  const player = $("player");
+  $("previewTitle").textContent = "🎬 " + file.name;
+  if (player.dataset.previewPath !== file.path || force) {
+    player.dataset.previewPath = file.path;
+    player.src = `/api/stream?path=${encodeURIComponent(file.path)}${force ? `&t=${Date.now()}` : ""}`;
+    $("metaInfo").replaceChildren();
+  }
+  if (position !== null) player.currentTime = position;
 
   let info = {};
-  try { info = await api(`/api/probe?path=${encodeURIComponent(path)}`); }
-  catch (e) { toast("读取元信息失败: " + e.message, true); }
+  try { info = await api(`/api/probe?path=${encodeURIComponent(file.path)}`); }
+  catch (e) {
+    if (request === previewRequest) toast("读取元信息失败: " + e.message, true);
+  }
+  if (request !== previewRequest) return false;
   const bits = [
     info.width && info.height ? `${info.width}×${info.height}` : null,
     info.duration ? `时长 ${fmtTime(info.duration)}` : null,
     info.codec ? info.codec : null,
     info.rotation ? `旋转 ${(360 - info.rotation) % 360}°` : null,
     info.bitrate ? `${(info.bitrate / 1e6).toFixed(1)} Mbps` : null,
-    fmtSize(info.size || f.size),
+    fmtSize(info.size || file.size),
   ].filter(Boolean);
-  $("metaInfo").innerHTML = bits.map((b) => `<span>${b}</span>`).join("");
-  // 当前处于检测/元数据面板时，切换文件后同步加载对应数据
-  if (currentOp() === "detect") loadDetectResult();
-  if (currentOp() === "meta") loadMetadata();
+  $("metaInfo").innerHTML = bits.map((b) => `<span>${esc(b)}</span>`).join("");
+  return true;
 }
 
 /* ---------- 截取 / 旋转（统一按勾选文件批量执行） ---------- */
@@ -657,7 +975,7 @@ async function doConcat() {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ paths, mode }),  // name 留空：后端用第一个文件名 + _拼接
     });
-    toast(`已提交拼接任务：${r.output.split("/").pop()}`);
+    toast(`已提交拼接任务：${r.output.split(/[\\/]/).pop()}`);
     pollTasks();
   } catch (e) { toast("拼接失败: " + e.message, true); }
 }
@@ -892,7 +1210,7 @@ async function pollTasks() {
           t.source === cur || t.output === cur || (t.sources || []).includes(cur));
         // 主动清掉相关文件的旧缩略图：旋转保留 mtime，后端缓存 key 不会自己变化
         const touched = [...new Set(fresh.flatMap((t) =>
-          [t.source, t.output, ...(t.sources || [])]).filter(Boolean))];
+          [t.source, t.external_output ? null : t.output, ...(t.sources || [])]).filter(Boolean))];
         if (touched.length) {
           try {
             await api("/api/thumbnail/invalidate", {
@@ -930,10 +1248,12 @@ function renderTasks(tasks) {
         <span class="task-status ${t.status}">${STATUS_TEXT[t.status]}${t.status === "running" ? ` ${Math.round(t.progress * 100)}%` : ""}</span>
       </div>
       <div class="progress-bar"><div class="progress-fill ${t.status}" style="width:${Math.round(t.progress * 100)}%"></div></div>
-      ${t.output && t.status === "done" ? `<div class="task-output" data-p="${esc(t.output)}" title="点击预览">↳ ${esc(t.output)}</div>` : ""}
+      ${t.output && t.status === "done" ? (t.external_output
+        ? `<a class="task-output" href="/api/tasks/${encodeURIComponent(t.id)}/output" target="_blank" rel="noopener" title="在新标签页预览">↳ ${esc(t.output)}</a>`
+        : `<div class="task-output" data-p="${esc(t.output)}" title="点击预览">↳ ${esc(t.output)}</div>`) : ""}
       ${t.error ? `<div class="task-error">${esc(t.error)}</div>` : ""}
     </div>`).join("");
-  $("taskList").querySelectorAll(".task-output").forEach((el) =>
+  $("taskList").querySelectorAll(".task-output[data-p]").forEach((el) =>
     el.addEventListener("click", () => { selectFile(el.dataset.p); }));
 }
 
@@ -941,23 +1261,116 @@ function renderTasks(tasks) {
 
 $("rootSaveBtn").addEventListener("click", saveRoot);
 $("openDirBtn").addEventListener("click", openCurrentDir);
+const extensionOptions = () => Array.from($("fileExtensionOptions").querySelectorAll('input[type="checkbox"]'));
+$("fileConfigBtn").addEventListener("click", () => {
+  const preferences = state.preferences;
+  $("ffmpegDirInput").value = preferences.ffmpeg_dir;
+  $("configDedupThreshold").value = Number((preferences.dedup_threshold * 100).toFixed(1));
+  $("configDedupDecode").value = preferences.dedup_decode_mode;
+  $("configDedupExactOnly").checked = preferences.dedup_exact_only;
+  $("configDedupExclusions").value = preferences.dedup_excluded_dirs.join("\n");
+  $("configDedupWorkers").value = preferences.dedup_workers;
+  $("configProcessingWorkers").value = preferences.processing_workers;
+  $("configOutputDir").value = preferences.output_dir;
+  $("configCacheDir").value = preferences.cache_dir;
+  $("fileConfigError").textContent = "";
+  for (const option of extensionOptions()) option.checked = !state.hiddenVideoExtensions.has(option.value);
+  $("fileConfigDialog").showModal();
+});
+$("selectAllExtensionsBtn").addEventListener("click", () => {
+  for (const option of extensionOptions()) option.checked = true;
+});
+$("cancelFileConfigBtn").addEventListener("click", () => $("fileConfigDialog").close());
+$("fileConfigDialog").addEventListener("cancel", (event) => {
+  if ($("cancelFileConfigBtn").disabled) event.preventDefault();
+});
+function setFileConfigBusy(busy) {
+  $("fileConfigForm").querySelectorAll("fieldset, .file-config-actions button").forEach((element) => {
+    element.disabled = busy;
+  });
+}
+document.querySelectorAll("[data-config-picker]").forEach((picker) => {
+  picker.addEventListener("click", async () => {
+    const input = $(picker.dataset.configPicker);
+    setFileConfigBusy(true);
+    $("fileConfigError").textContent = "";
+    try {
+      const path = await pickFolder(input.value);
+      if (path) input.value = path;
+    } catch (err) {
+      $("fileConfigError").textContent = err.message;
+    } finally {
+      setFileConfigBusy(false);
+      input.focus();
+    }
+  });
+});
+$("fileConfigForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if ($("saveFileConfigBtn").disabled) return;
+  const hiddenExtensions = extensionOptions().filter((option) => !option.checked).map((option) => option.value);
+  const settings = {
+    ffmpeg_dir: $("ffmpegDirInput").value.trim(),
+    dedup_threshold: $("configDedupThreshold").valueAsNumber / 100,
+    dedup_decode_mode: $("configDedupDecode").value,
+    dedup_exact_only: $("configDedupExactOnly").checked,
+    dedup_excluded_dirs: $("configDedupExclusions").value.split(/\r?\n/),
+    dedup_workers: $("configDedupWorkers").valueAsNumber,
+    processing_workers: $("configProcessingWorkers").valueAsNumber,
+    output_dir: $("configOutputDir").value.trim(),
+    cache_dir: $("configCacheDir").value.trim(),
+  };
+  $("fileConfigError").textContent = "";
+  setFileConfigBusy(true);
+  try {
+    const { preferences } = await api("/api/settings/preferences", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(settings),
+    });
+    state.preferences = preferences;
+    applyDedupDefaults();
+    localStorage.setItem("hiddenVideoExtensions", hiddenExtensions.join(","));
+    state.hiddenVideoExtensions = new Set(hiddenExtensions);
+    $("fileConfigDialog").close();
+    applyFileExtensionFilter();
+  } catch (err) {
+    $("fileConfigError").textContent = err.message;
+    $("fileConfigError").scrollIntoView({ block: "nearest" });
+  } finally {
+    setFileConfigBusy(false);
+  }
+});
 $("rootInput").addEventListener("keydown", (e) => e.key === "Enter" && saveRoot());
 $("pickBtn").addEventListener("click", pickRoot);
 $("dedupBtn").addEventListener("click", openDedup);
-$("dedupCloseBtn").addEventListener("click", () => $("dedupDialog").close());
+$("dedupCloseBtn").addEventListener("click", closeDedup);
 $("dedupForm").addEventListener("submit", startDedup);
-$("dedupExactOnly").addEventListener("change", (e) => {
-  $("dedupThreshold").disabled = e.target.checked;
-  $("dedupDecodeMode").disabled = e.target.checked;
+$("dedupTrashBtn").addEventListener("click", trashDuplicates);
+$("dedupResults").addEventListener("click", ({ target }) => {
+  const preview = target.closest("[data-preview-path]");
+  if (preview) selectDedupPreview(preview.dataset.previewPath);
 });
+$("dedupResults").addEventListener("change", ({ target }) => {
+  const path = target.dataset.path;
+  if (path === undefined) return;
+  if (target.checked) dedupChecked.add(path);
+  else dedupChecked.delete(path);
+  updateDedupSelection();
+});
+$("dedupExactOnly").addEventListener("change", updateDedupControls);
 $("playRangeBtn").addEventListener("click", playRange);
 function updatePreviewToggleBtn() {
-  $("previewToggleBtn").textContent = state.showPreview ? "🎬 隐藏预览" : "🎬 显示预览";
+  const visible = dedupActive ? dedupShowPreview : state.showPreview;
+  $("previewToggleBtn").textContent = visible ? "🎬 隐藏预览" : "🎬 显示预览";
 }
 $("previewToggleBtn").addEventListener("click", () => {
-  state.showPreview = !state.showPreview;
-  if (!state.showPreview) { try { $("player").pause(); } catch { /* ignore */ } }
-  localStorage.setItem("showPreview", state.showPreview ? "1" : "0");
+  if (dedupActive) dedupShowPreview = !dedupShowPreview;
+  else {
+    state.showPreview = !state.showPreview;
+    localStorage.setItem("showPreview", state.showPreview ? "1" : "0");
+  }
+  if (!(dedupActive ? dedupShowPreview : state.showPreview)) $("player").pause();
   updatePreviewToggleBtn();
   updateWorkspace();
 });
@@ -1048,7 +1461,7 @@ document.querySelectorAll(".degree-group button").forEach((btn) => {
 function initSplitter() {
   const bar = $("splitter"), sidebar = $("sidebar");
   const saved = Number(localStorage.getItem("sidebarWidthPct"));
-  if (saved >= 20 && saved <= 80) sidebar.style.width = `${saved}%`;
+  if (saved >= 20 && saved <= 80) sidebar.style.setProperty("--sidebar-width", `${saved}%`);
 
   bar.addEventListener("mousedown", (e) => {
     e.preventDefault();
@@ -1058,7 +1471,7 @@ function initSplitter() {
       const rect = document.querySelector("main").getBoundingClientRect();
       let pct = (ev.clientX - rect.left) / rect.width * 100;
       pct = Math.max(20, Math.min(80, pct));  // 两侧至少各留 20%
-      sidebar.style.width = `${pct}%`;
+      sidebar.style.setProperty("--sidebar-width", `${pct}%`);
       localStorage.setItem("sidebarWidthPct", String(pct));
     };
     const up = () => {

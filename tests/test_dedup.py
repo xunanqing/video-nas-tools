@@ -6,11 +6,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from app.config import media_tools
 from app.dedup.cache import VideoFile
+from app.dedup.cli import discover
 from app.dedup.matching import VisualFeature, compare, duration_candidates
-from app.dedup.media import FFMPEG_BIN, FFPROBE_BIN, FRAME_BYTES, extract_gray_frames, sample_times
+from app.dedup.media import FRAME_BYTES, extract_gray_frames, sample_times
+from app.dedup.review import Review, describe_video, recommend
 
 
 class MatchingTests(unittest.TestCase):
@@ -65,6 +68,46 @@ class DecodeTests(unittest.TestCase):
         return [command[command.index("-hwaccel:V:0") + 1] for command in commands]
 
 
+class ReviewTests(unittest.TestCase):
+    def test_recommendation_prefers_resolution_then_original_time(self):
+        files = {
+            "old.mp4": dict(width=1920, height=1080, duration=30, original_time=100, file_time=100),
+            "new.mp4": dict(width=1920, height=1080, duration=30, original_time=200, file_time=200),
+            "low.mp4": dict(width=640, height=360, duration=30, original_time=50, file_time=50),
+        }
+        self.assertEqual(recommend(files, {path: [0] for path in files}), ["new.mp4", "low.mp4"])
+        info = describe_video(VideoFile(Path("old.mp4"), 1, 200_000_000_000, 0, birthtime=150), {"created": 100})
+        self.assertEqual((info["original_time"], info["file_time"], info["time_source"]), (100, 150, "metadata"))
+
+    def test_indirect_match_does_not_make_a_file_redundant(self):
+        files = {path: dict(original_time=i, file_time=i) for i, path in enumerate(("a", "b", "c"))}
+        self.assertEqual(recommend(files, {"a": [0], "b": [0, 1], "c": [1]}), ["b"])
+
+    def test_cleanup_checks_all_files_before_trashing_and_allows_only_direct_matches(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            names = ("a.mp4", "b.mp4", "c.mp4")
+            for name in names:
+                (root / name).write_bytes(name.encode())
+            a, b, c = names
+            review = Review(root, {name: VideoFile.read(root / name) for name in names},
+                            [(a, b), (b, c)], {a: [0], b: [0, 1], c: [1]})
+            trash = Mock()
+            with self.assertRaisesRegex(ValueError, "至少一个直接匹配"):
+                review.move_to_trash([b, c], trash)
+            with self.assertRaisesRegex(ValueError, "不在这次查重结果"):
+                review.move_to_trash(["../outside.mp4"], trash)
+            (root / c).write_bytes(b"modified since scan")
+            with self.assertRaisesRegex(ValueError, "已变化"):
+                review.move_to_trash([a, c], trash)
+            trash.assert_not_called()
+
+            self.assertEqual(review.move_to_trash([b, b], trash), {"deleted_paths": [b], "errors": []})
+            trash.assert_called_once_with(str(root / b))
+            with self.assertRaisesRegex(ValueError, "至少一个直接匹配"):
+                review.move_to_trash([a], trash)
+
+
 class ScanTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -78,13 +121,31 @@ class ScanTests(unittest.TestCase):
         self.cache = self.workspace / "cache.sqlite3"
 
     def run_scan(self, *options, expected_exit=0):
+        command = (
+            "import sys; from pathlib import Path; from app import config; "
+            "from app.dedup.cli import main; config.SETTINGS_FILE = Path(sys.argv.pop(1)); "
+            "sys.exit(main())"
+        )
+        ffmpeg, ffprobe = media_tools()
         proc = subprocess.run(
-            [sys.executable, "-m", "app.dedup.cli", str(self.media), str(self.nested),
+            [sys.executable, "-c", command, str(self.workspace / "settings.json"),
+             str(self.media), str(self.nested),
              str(self.other_root), "--cache", str(self.cache), *options],
             capture_output=True, timeout=120,
+            env={**os.environ, "FFMPEG_PATH": ffmpeg, "FFPROBE_PATH": ffprobe},
         )
         self.assertEqual(proc.returncode, expected_exit, proc.stderr.decode(errors="replace"))
         return [json.loads(line) for line in proc.stdout.splitlines()]
+
+    def test_exclusions_prune_subtrees_and_explicit_scan_roots(self):
+        recycle = self.nested / "#RECYCLE"
+        recycle.mkdir()
+        for folder in (self.media, recycle, self.other_root):
+            (folder / "clip.mp4").write_bytes(b"video")
+        roots = [folder.resolve() for folder in (self.media, recycle, self.other_root)]
+        by_size, errors = discover(roots, ("#recycle", str(roots[-1])))
+        self.assertEqual(errors, 0)
+        self.assertEqual([video.path for video in by_size[5]], [roots[0] / "clip.mp4"])
 
     def test_exact_scan_reuses_cache_and_invalidates_modified_file(self):
         source = self.media / "a.mp4"
@@ -106,7 +167,7 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(updated[-1]["exact_cache_hits"], 2)
         self.assertEqual(self.run_scan("--exact-only", "--refresh")[-1]["exact_cache_hits"], 0)
 
-    @unittest.skipUnless(shutil.which(FFMPEG_BIN) and shutil.which(FFPROBE_BIN), "需要 FFmpeg 和 FFprobe")
+    @unittest.skipUnless(all(shutil.which(tool) for tool in media_tools()), "需要 FFmpeg 和 FFprobe")
     def test_visual_scan_recognizes_reencoding_and_isolates_bad_input(self):
         source = self.media / "source.mp4"
         clone = self.nested / "完全相同.mp4"
@@ -116,7 +177,7 @@ class ScanTests(unittest.TestCase):
 
         def ffmpeg(*args):
             subprocess.run(
-                [FFMPEG_BIN, "-nostdin", "-v", "error", *args],
+                [media_tools()[0], "-nostdin", "-v", "error", *args],
                 check=True, capture_output=True, timeout=30,
             )
 
@@ -127,7 +188,7 @@ class ScanTests(unittest.TestCase):
         broken.write_bytes(b"broken")
         originals = {path: path.read_bytes() for path in (source, clone, variant, negative, broken)}
 
-        rows = self.run_scan(expected_exit=1)
+        rows = self.run_scan("--workers", "2", expected_exit=1)
         self.assertEqual(rows[-1]["errors"], 1)
         self.assertEqual(rows[-1]["exact_groups"], 1)
         pairs = {frozenset(Path(path).name for path in row["paths"]): row["similarity"]

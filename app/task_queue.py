@@ -4,6 +4,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Callable, Optional
 
 
@@ -22,6 +23,7 @@ class Task:
     title: str
     source: str
     output: str = ""
+    external_output: Path | None = None
     sources: list = field(default_factory=list)  # 多源文件任务（如拼接）
     status: str = TaskStatus.QUEUED
     progress: float = 0.0
@@ -33,7 +35,14 @@ class Task:
 class TaskQueue:
     def __init__(self, workers: int = 2):
         self._tasks: dict = {}
-        self._sem = asyncio.Semaphore(workers)
+        self._workers = workers
+        self._running = 0
+        self._slots = asyncio.Condition()
+
+    async def set_workers(self, workers: int) -> None:
+        async with self._slots:
+            self._workers = workers
+            self._slots.notify_all()
 
     def get(self, task_id: str) -> Optional[Task]:
         return self._tasks.get(task_id)
@@ -56,29 +65,36 @@ class TaskQueue:
         return len(ids)
 
     async def submit(self, kind: str, title: str, source: str, output: str,
-                     job: Callable, sources: list = None) -> Task:
+                     job: Callable, sources: list = None, external_output: Path | None = None) -> Task:
         """job: async callable(on_progress) -> None"""
         task = Task(id=uuid.uuid4().hex[:12], kind=kind, title=title,
-                    source=source, output=output, sources=sources or [])
+                    source=source, output=output, sources=sources or [], external_output=external_output)
         self._tasks[task.id] = task
         asyncio.create_task(self._run(task, job))
         return task
 
     async def _run(self, task: Task, job: Callable):
-        async with self._sem:
+        try:
+            async with self._slots:
+                await self._slots.wait_for(lambda: self._running < self._workers)
+                self._running += 1
             task.status = TaskStatus.RUNNING
             try:
                 await job(self._set_progress(task))
-                task.status = TaskStatus.DONE
-                task.progress = 1.0
-            except asyncio.CancelledError:
-                task.status = TaskStatus.FAILED
-                task.error = "任务被取消"
-            except Exception as e:  # noqa: BLE001
-                task.status = TaskStatus.FAILED
-                task.error = str(e)[:300]
             finally:
-                task.finished_at = time.time()
+                async with self._slots:
+                    self._running -= 1
+                    self._slots.notify_all()
+            task.status = TaskStatus.DONE
+            task.progress = 1.0
+        except asyncio.CancelledError:
+            task.status = TaskStatus.FAILED
+            task.error = "任务被取消"
+        except Exception as e:  # noqa: BLE001
+            task.status = TaskStatus.FAILED
+            task.error = str(e)[:300]
+        finally:
+            task.finished_at = time.time()
 
     @staticmethod
     def _set_progress(task: Task):

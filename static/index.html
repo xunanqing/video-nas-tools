@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Video NAS Tools</title>
-<link rel="stylesheet" href="/static/style.css?v=20261128d">
+<link rel="stylesheet" href="/static/style.css?v=20261128l">
 </head>
 <body>
 <header>
@@ -14,16 +14,87 @@
     <button id="pickBtn" class="btn" title="打开系统目录选择对话框">📂 浏览</button>
     <button id="rootSaveBtn" class="btn">保存</button>
     <button id="openDirBtn" class="btn" title="在系统文件管理器中打开当前目录">🗂 打开</button>
+    <button id="fileConfigBtn" class="btn" type="button" aria-haspopup="dialog" disabled>配置</button>
   </div>
 </header>
+
+<dialog id="fileConfigDialog" class="file-config-dialog" aria-labelledby="fileConfigTitle">
+  <form id="fileConfigForm">
+    <h2 id="fileConfigTitle">配置</h2>
+    <fieldset>
+      <legend><label for="ffmpegDirInput">FFmpeg 目录</label></legend>
+      <div class="ffmpeg-dir-row">
+        <input id="ffmpegDirInput" type="text" spellcheck="false" placeholder="留空时自动查找" aria-describedby="ffmpegDirHint fileConfigError">
+        <button class="btn" type="button" data-config-picker="ffmpegDirInput" aria-label="浏览 FFmpeg 目录" hidden>浏览</button>
+      </div>
+      <p id="ffmpegDirHint">填写服务端上同时包含 FFmpeg 和 FFprobe 的目录。Docker 中填写容器内路径。</p>
+    </fieldset>
+    <fieldset>
+      <legend>查重默认参数</legend>
+      <div class="config-grid">
+        <label>最低相似度（%）
+          <input id="configDedupThreshold" type="number" min="0" max="100" step="0.1" required>
+        </label>
+        <label>解码模式
+          <select id="configDedupDecode">
+            <option value="auto">自动（GPU 优先）</option>
+            <option value="cpu">仅 CPU</option>
+          </select>
+        </label>
+      </div>
+      <label class="config-check"><input id="configDedupExactOnly" type="checkbox"> 仅查找完全相同的文件</label>
+      <label class="config-field">排除目录
+        <textarea id="configDedupExclusions" rows="3" placeholder="例如 #recycle" aria-describedby="configExclusionsHint"></textarea>
+      </label>
+      <p id="configExclusionsHint" class="config-hint">每行一个目录名或服务端绝对路径。匹配的目录及其子目录会被跳过。</p>
+    </fieldset>
+    <fieldset>
+      <legend>并发上限</legend>
+      <div class="config-grid">
+        <label>同时抽帧的视频数
+          <input id="configDedupWorkers" type="number" min="1" max="8" required>
+        </label>
+        <label>同时运行的处理任务数
+          <input id="configProcessingWorkers" type="number" min="1" max="8" required>
+        </label>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>存储路径</legend>
+      <label class="config-field" for="configOutputDir">截取与拼接输出目录</label>
+      <div class="ffmpeg-dir-row">
+        <input id="configOutputDir" type="text" spellcheck="false" placeholder="留空时输出到源视频目录">
+        <button class="btn" type="button" data-config-picker="configOutputDir" aria-label="浏览输出目录" hidden>浏览</button>
+      </div>
+      <label class="config-field" for="configCacheDir">缓存目录</label>
+      <div class="ffmpeg-dir-row">
+        <input id="configCacheDir" type="text" spellcheck="false" placeholder="留空时使用默认位置" aria-describedby="configCacheHint">
+        <button class="btn" type="button" data-config-picker="configCacheDir" aria-label="浏览缓存目录" hidden>浏览</button>
+      </div>
+      <p id="configCacheHint" class="config-hint">存储缩略图和查重特征，建议使用运行服务的机器的本地磁盘。</p>
+    </fieldset>
+    <fieldset>
+      <legend>显示的文件扩展名</legend>
+      <div id="fileExtensionOptions" class="file-extension-options"></div>
+    </fieldset>
+    <p id="fileConfigError" role="alert"></p>
+    <div class="file-config-actions">
+      <button id="selectAllExtensionsBtn" class="btn ghost" type="button">全选扩展名</button>
+      <button id="cancelFileConfigBtn" class="btn" type="button">取消</button>
+      <button id="saveFileConfigBtn" class="btn primary" type="submit">保存</button>
+    </div>
+  </form>
+</dialog>
 
 <main>
   <aside id="sidebar">
     <div class="sidebar-head">
       <div class="sidebar-tools">
-        <button id="dedupBtn" class="btn ghost sm" type="button" aria-haspopup="dialog">视频查重</button>
+        <button id="dedupBtn" class="btn ghost sm" type="button" aria-expanded="false" aria-controls="dedupPanel">视频查重</button>
         <button id="previewToggleBtn" class="btn ghost sm" title="显示/隐藏视频预览">🎬 隐藏预览</button>
       </div>
+    </div>
+    <div id="libraryControls" class="sidebar-head">
       <div id="dirList" class="dir-list"></div>
       <div class="file-toolbar">
         <div class="view-switch" title="查看方式">
@@ -44,6 +115,33 @@
       </div>
     </div>
     <div id="fileList" class="file-list"></div>
+    <section id="dedupPanel" class="dedup-panel" aria-labelledby="dedupTitle" hidden>
+      <div class="dedup-heading">
+        <h2 id="dedupTitle">视频查重</h2>
+        <button id="dedupCloseBtn" class="btn sm" type="button">返回文件列表</button>
+      </div>
+      <p>扫描目录（含子目录）<strong id="dedupFolder"></strong></p>
+      <form id="dedupForm" class="dedup-controls">
+        <label>最低相似度
+          <input id="dedupThreshold" type="number" min="0" max="100" step="0.1" value="96" required> %
+        </label>
+        <label>解码
+          <select id="dedupDecodeMode">
+            <option value="auto" selected>自动（GPU 优先）</option>
+            <option value="cpu">仅 CPU</option>
+          </select>
+        </label>
+        <label><input id="dedupExactOnly" type="checkbox"> 仅查找完全相同的文件</label>
+        <button id="dedupScanBtn" class="btn primary" type="submit">开始扫描</button>
+      </form>
+      <p id="dedupStatus" role="status"></p>
+      <div id="dedupActions" class="dedup-actions" hidden>
+        <span id="dedupSelection" role="status"></span>
+        <button id="dedupTrashBtn" class="btn danger sm" type="button" disabled>移入回收站</button>
+      </div>
+      <p id="dedupFeedback" role="status"></p>
+      <ol id="dedupResults" class="dedup-results"></ol>
+    </section>
   </aside>
 
   <div id="splitter" class="splitter" title="拖拽调整左右比例"></div>
@@ -51,8 +149,8 @@
   <section id="workspace">
     <div id="emptyState" class="empty-state">
       <div class="empty-icon">🎞️</div>
-      <p>从左侧选择一个视频文件开始预览</p>
-      <p class="hint">勾选文件即可批量截取 / 旋转 / 删除</p>
+      <p id="emptyPreviewMessage">从左侧选择一个视频文件开始预览</p>
+      <p id="emptyPreviewHint" class="hint">勾选文件即可批量截取 / 旋转 / 删除</p>
     </div>
 
     <div id="previewArea" hidden>
@@ -217,29 +315,6 @@
   </section>
 </main>
 
-<dialog id="dedupDialog" class="dedup-dialog" aria-labelledby="dedupTitle">
-  <div class="dedup-heading">
-    <h2 id="dedupTitle">视频查重</h2>
-    <button id="dedupCloseBtn" class="btn sm" type="button">关闭</button>
-  </div>
-  <p>扫描目录（含子目录）<strong id="dedupFolder"></strong></p>
-  <form id="dedupForm" class="dedup-controls">
-    <label>最低相似度
-      <input id="dedupThreshold" type="number" min="0" max="100" step="0.1" value="96" required> %
-    </label>
-    <label>解码
-      <select id="dedupDecodeMode">
-        <option value="auto" selected>自动（GPU 优先）</option>
-        <option value="cpu">仅 CPU</option>
-      </select>
-    </label>
-    <label><input id="dedupExactOnly" type="checkbox"> 仅查找完全相同的文件</label>
-    <button id="dedupScanBtn" class="btn primary" type="submit">开始扫描</button>
-  </form>
-  <p id="dedupStatus" role="status"></p>
-  <ol id="dedupResults" class="dedup-results"></ol>
-</dialog>
-
 <button id="taskFab" class="task-fab" title="展开任务队列">
   ⚙️<span id="fabBadge" class="fab-badge" hidden></span>
 </button>
@@ -254,6 +329,6 @@
 </div>
 
 <div id="toast" class="toast"></div>
-<script src="/static/app.js?v=20261128d"></script>
+<script src="/static/app.js?v=20261128l"></script>
 </body>
 </html>

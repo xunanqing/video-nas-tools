@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Literal
 
-from app.config import FFMPEG_BIN, FFPROBE_BIN
+from app.config import media_tools
 
 SIDE = 32
 FRAME_BYTES = SIDE * SIDE
@@ -35,7 +35,7 @@ def run_tool(binary: str, args: list[str], timeout: float = 30) -> bytes:
 
 
 def probe_duration(path: Path) -> float:
-    output = run_tool(FFPROBE_BIN, [
+    output = run_tool(media_tools()[1], [
         "-protocol_whitelist", "file", "-select_streams", "V:0",
         "-show_entries", "stream=duration:format=duration", "-of", "json", str(path),
     ])
@@ -60,18 +60,19 @@ def extract_gray_frames(
     path: Path, duration: float, samples: int, decode_mode: DecodeMode = "auto",
 ) -> bytes:
     positions = sample_times(duration, samples)
+    ffmpeg, _ = media_tools()
     if decode_mode == "auto":
         try:
-            return _extract_gray_frames(path, positions, "auto")
+            return _extract_gray_frames(ffmpeg, path, positions, "auto")
         except MediaError as exc:
             LOGGER.info("%s 自动解码未成功，改用 CPU 重新抽帧：%s", path, exc)
-    return _extract_gray_frames(path, positions, "none")
+    return _extract_gray_frames(ffmpeg, path, positions, "none")
 
 
-def _extract_gray_frames(path: Path, positions: list[float], hwaccel: str) -> bytes:
+def _extract_gray_frames(ffmpeg: str, path: Path, positions: list[float], hwaccel: str) -> bytes:
     frames = bytearray()
     for position in positions:
-        frame = run_tool(FFMPEG_BIN, [
+        frame = run_tool(ffmpeg, [
             "-nostdin", "-filter_threads", "1", "-protocol_whitelist", "file",
             "-ss", f"{position:.9f}", "-threads", "1",
             "-hwaccel:V:0", hwaccel, "-i", str(path),

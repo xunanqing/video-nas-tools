@@ -13,7 +13,7 @@
 - **元数据与标签**：查看完整的容器/流/章节信息，编辑标题、备注、作者、语言等元数据（stream copy，不重编码）；标签存于本地标签库，与视频文件解耦，支持手动与自动来源。
 - **批量删除**：移入系统回收站，不是永久删除，可恢复。
 - **批量重命名**：按「基础名_序号」批量命名，基础名可自定义或默认取首个文件名。
-- **任务队列**：最多 2 个任务并发，实时进度，可清除已完成任务；任务完成后自动刷新列表与预览。
+- **任务队列**：默认 2 个处理任务并发，可在「配置」中调整，实时显示进度。
 - **其他**：路径记忆、缩略图缓存、文件夹选择弹框置顶显示。
 
 ## 快速开始
@@ -21,7 +21,7 @@
 环境要求：
 
 - Python 3.12+
-- `ffmpeg` 与 `ffprobe` 已加入 PATH
+- 已安装 `ffmpeg` 与 `ffprobe`
 - Windows 或 macOS 桌面可使用「浏览」按钮打开系统目录选择框。Linux／NAS 服务使用「输入路径」。
 
 安装与启动：
@@ -33,12 +33,21 @@ python run.py
 
 浏览器打开 <http://127.0.0.1:8899> 即可使用。
 
-如 ffmpeg 不在 PATH 中，可通过环境变量指定：
+在顶栏「配置」中填写同时包含 FFmpeg 和 FFprobe 的目录，例如 Windows 下的 `C:\tools\ffmpeg\bin`。macOS 和 Windows 可在服务端桌面用「浏览」选择目录，NAS／Docker 使用服务端或容器内的绝对路径。保存后，后续执行的命令会使用该目录。
+
+目录留空时，程序先读取 `FFMPEG_PATH` 和 `FFPROBE_PATH`，再通过 PATH 查找。Windows 命令提示符示例：
 
 ```bash
 set FFMPEG_PATH=C:\tools\ffmpeg\bin\ffmpeg.exe
 set FFPROBE_PATH=C:\tools\ffmpeg\bin\ffprobe.exe
 ```
+
+顶栏「配置」还可以保存查重默认值（96%、自动解码、内容相似查重）、排除目录、预览列表的扩展名以及以下选项：
+
+- **查重排除目录**：每行一个目录名（如 `#recycle`）或服务端绝对路径，匹配目录及其子树都会跳过。
+- **并发上限**：查重默认同时抽帧 1 个视频，处理队列默认同时运行 2 个任务。修改后台并发上限后，正在运行的任务继续执行。
+- **输出目录**：适用于截取和拼接。留空时输出到源视频目录。输出位于视频根目录外时，可从任务队列在新标签页预览。
+- **缓存目录**：在所选目录下保存 `thumbnails/` 和 `dedup.sqlite3`，旧缓存保留在原位置。留空时使用原有默认位置。目录路径以服务端实际看到的文件系统为准。
 
 ## 使用指南
 
@@ -56,9 +65,9 @@ set FFPROBE_PATH=C:\tools\ffmpeg\bin\ffprobe.exe
 | --- | --- |
 | Web 框架 | FastAPI + uvicorn，单端口本机服务 |
 | 视频处理 | ffmpeg / ffprobe，支持 stream copy 与重编码两种策略 |
-| 任务调度 | `asyncio` + Semaphore，2 并发，同一文件的旋转操作加锁互斥 |
+| 任务调度 | `asyncio` 任务队列，默认 2 并发，同一文件的旋转操作加锁互斥 |
 | 前端 | 原生 HTML / CSS / JavaScript，单页应用，无构建依赖 |
-| 配置与缓存 | `settings.json` 保存根目录；`.thumbnails/` 保存缩略图缓存；`.workbuddy/tags.json` 与 `detections.json` 保存标签与检测结果 |
+| 配置与缓存 | `settings.json` 保存根目录和服务端偏好；`.thumbnails/` 是默认缩略图缓存目录；`.workbuddy/tags.json` 与 `detections.json` 保存标签与检测结果 |
 | 智能检测 | ffmpeg `blackdetect` / `silencedetect` / `select+showinfo` 分析流 + 解析 stderr |
 | 标签系统 | 独立 JSON 标签库，支持 `manual` / `auto` / `detected` / `imported` 来源与置信度 |
 
@@ -73,7 +82,9 @@ set FFPROBE_PATH=C:\tools\ffmpeg\bin\ffprobe.exe
 
 ## 视频查重
 
-在左侧「显示／隐藏预览」同一行点击「视频查重」，可对当前目录及子目录执行只读扫描。窗口显示完全相同的文件组、内容相似的文件对和读取失败计数。独立 CLI 支持扫描多个目录、输出 JSON Lines。两种入口都使用 SHA-256 和灰度抽帧，SQLite 缓存在运行机本地，可用 `VIDEO_NAS_DEDUP_CACHE` 指定本地数据库文件。
+在左侧「显示／隐藏预览」同一行点击「视频查重」，可对当前目录及子目录执行只读扫描。结果显示在左侧，点击缩略图或文件名可在右侧播放器预览，复选框用于选择清理项。结果展示视频规格和时间来源。保留建议优先考虑分辨率和时长，质量指标相同时优先保留时间较早的文件。时间优先取视频的创建元数据，缺失时参考文件的创建和修改时间。默认勾选多余项，可调整后确认批量移入回收站。每个待清理文件都必须有至少一个直接匹配的保留项。
+
+独立 CLI 支持扫描多个目录、输出 JSON Lines，共用 Web 保存的查重默认值、排除目录和缓存目录。命令行的 `--threshold`、`--decode`、`--exact-only`／`--no-exact-only`、`--workers`、`--cache` 可覆盖对应设置。缓存目录留空时，可用 `VIDEO_NAS_DEDUP_CACHE` 指定本地数据库文件。
 
 ```bat
 dedup.bat "D:\dedup-test" "\\fnos\media\dedup-test" --threshold 0.96 > "%TEMP%\dedup-results.jsonl"

@@ -4,12 +4,12 @@ import json
 import re
 from pathlib import Path
 
-from .config import FFMPEG_BIN, FFPROBE_BIN
+from .config import media_tools
 
 
 async def probe(path: Path, detailed: bool = False) -> dict:
     """返回视频元信息；detailed=True 时附带容器/流标签与章节。"""
-    cmd = [FFPROBE_BIN, "-v", "error", "-print_format", "json",
+    cmd = [media_tools()[1], "-v", "error", "-print_format", "json",
            "-show_format", "-show_streams"]
     if detailed:
         cmd.append("-show_chapters")
@@ -167,7 +167,7 @@ async def run_ffmpeg(args: list, total_duration: float,
                      on_progress=None) -> None:
     """执行 ffmpeg 并解析 -progress 输出，回调进度(0~1)。"""
     proc = await asyncio.create_subprocess_exec(
-        FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
+        media_tools()[0], "-hide_banner", "-loglevel", "error", "-y",
         *args, "-progress", "pipe:1", "-nostats",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
@@ -239,7 +239,7 @@ DETECT_DEFAULTS = {
 async def _analyze(args: list) -> str:
     """执行纯分析型 ffmpeg（不产出文件），返回 stderr 文本。"""
     proc = await asyncio.create_subprocess_exec(
-        FFMPEG_BIN, "-hide_banner", "-nostats", "-loglevel", "info", "-y",
+        media_tools()[0], "-hide_banner", "-nostats", "-loglevel", "info", "-y",
         *args, stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE)
     err = (await proc.stderr.read()).decode(errors="replace")
