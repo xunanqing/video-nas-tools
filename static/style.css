@@ -56,7 +56,7 @@ main { flex: 1; display: flex; min-height: 0; }
 body.resizing { cursor: col-resize; user-select: none; }
 body.resizing #player { pointer-events: none; }
 .sidebar-tools {
-  display: flex; justify-content: flex-end;
+  display: flex; justify-content: flex-end; gap: 6px;
   padding: 0 4px 8px; border-bottom: 1px solid var(--border); margin-bottom: 8px;
 }
 .dir-list { display: flex; flex-direction: column; gap: 2px; }
@@ -103,10 +103,11 @@ body.selecting-files .grid-item img { pointer-events: none; }
 .dedup-heading { justify-content: space-between; }
 .dedup-heading h2 { font-size: 18px; }
 #dedupFolder { display: block; margin: 4px 0 12px; overflow-wrap: anywhere; }
-#dedupThreshold {
-  width: 66px; padding: 4px; border: 1px solid var(--border);
+#dedupThreshold, #dedupDecodeMode {
+  padding: 4px; border: 1px solid var(--border);
   border-radius: 4px; font: inherit;
 }
+#dedupThreshold { width: 66px; }
 #dedupStatus { color: var(--muted); }
 .dedup-results { list-style: none; }
 .dedup-results > li {

@@ -20,7 +20,7 @@
 | `app/ffmpeg_service.py` | ffmpeg/ffprobe 封装：探测、截取、旋转、拼接的参数构建与执行 |
 | `app/task_queue.py` | 异步任务队列（2 并发）、Task 数据模型、进度与状态 |
 | `app/tag_store.py` | 本地标签库：多来源、置信度、扩展 meta，智能标签扩展点 |
-| `app/dedup/` | 第一阶段只读查重 CLI、Web 扫描、灰度匹配与 SQLite 缓存 |
+| `app/dedup/` | 只读查重 CLI、Web 扫描、自动硬解／CPU 抽帧、灰度匹配与 SQLite 缓存 |
 | `dedup.bat` | Windows 查重 CLI 启动入口 |
 | `tests/test_dedup.py` | 查重单元测试与合成视频集成测试 |
 | `docs/video-dedup.md` | VDF 源码核查、查重路线及验证记录 |
@@ -126,7 +126,8 @@ python run.py
 ## 9. 视频查重协作交接
 
 - 第一阶段提供 `python -m app.dedup.cli` 和 `dedup.bat`。支持多目录递归、SHA-256 全文件查重、CPU 32×32 灰度比较与本地 SQLite 特征复用。扫描只读视频并输出 JSON Lines。
-- 文件列表工具栏已有「视频查重」。Web 基线扫描当前目录及子目录，显示结果和读取失败数量。大型目录、多根目录界面和持久化任务仍按阶段计划推进。无桌面 NAS 上通过「输入路径」设置挂载目录。
+- Web 和 CLI 抽帧默认由 FFmpeg 自动选择可用的硬解后端。自动模式无法完成抽帧时，整段视频以软件解码重试。CLI 用 `--decode cpu` 强制软件解码，用 `--refresh` 跳过已有特征。
+- 「视频查重」在左侧工具栏，与「显示／隐藏预览」同一行。Web 基线扫描当前目录及子目录，显示结果和读取失败数量。大型目录、多根目录界面和持久化任务仍按阶段计划推进。无桌面 NAS 上通过「输入路径」设置挂载目录。
 - 在 [视频查重源码调研与实施计划](docs/video-dedup.md) 查看固定提交的 VDF 源码定位、各阶段范围、验收方法和结果。后续每阶段更新此文档，写明实现、测试环境、复现命令、结果与待验证项，供各 Agent 和 PC 测试同步。
 - 当前开发机是 Intel macOS。用户的 Windows 10 PC 配有双 RTX 2080 Ti，通过 SMB 读取飞牛 NAS。第一阶段合成测试在 macOS 已通过。Windows BAT、实际共享目录及真实素材准确率待在 PC 验收，再进入 pHash、旋转和镜像阶段。
 - Web 扫描延续相对路径边界校验。旋转和元数据编辑在替换文件后保留 mtime，并失效查重缓存。扫描和相似度结果本身不触发任何视频写入或删除。验证使用合成文件或可丢弃测试副本。

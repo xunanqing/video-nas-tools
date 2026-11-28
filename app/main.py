@@ -22,6 +22,7 @@ from . import ffmpeg_service as ff
 from . import tag_store
 from .config import (BASE_DIR, DEFAULT_ROOT, MIME_MAP, VIDEO_EXTS, get_root,
                      load_settings, set_root)
+from .dedup.media import DecodeMode
 from .dedup.web import invalidate_features, scan_folder
 from .task_queue import TaskQueue
 
@@ -252,6 +253,7 @@ class DedupReq(BaseModel):
     path: str = ""
     threshold: float = Field(default=0.96, ge=0, le=1)
     exact_only: bool = False
+    decode_mode: DecodeMode = "auto"
 
 
 @app.post("/api/dedup/scan")
@@ -263,7 +265,7 @@ async def dedup_scan(req: DedupReq):
         raise HTTPException(409, "已有查重扫描正在运行")
     async with dedup_lock:
         try:
-            return await asyncio.to_thread(scan_folder, folder, req.threshold, req.exact_only)
+            return await asyncio.to_thread(scan_folder, folder, req.threshold, req.exact_only, req.decode_mode)
         except (OSError, sqlite3.Error) as exc:
             raise HTTPException(503, str(exc)) from exc
 

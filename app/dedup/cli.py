@@ -1,4 +1,4 @@
-"""CPU 查重入口。以 JSON Lines 输出结果，扫描日志写入 stderr。"""
+"""视频查重入口。以 JSON Lines 输出结果，扫描日志写入 stderr。"""
 
 import argparse
 from collections import defaultdict
@@ -18,7 +18,8 @@ from app.config import VIDEO_EXTS
 
 from .cache import FeatureCache, VideoFile
 from .matching import VisualFeature, compare, duration_candidates
-from .media import FFMPEG_BIN, FFPROBE_BIN, FRAME_BYTES, MediaError, extract_gray_frames, probe_duration
+from .media import (FFMPEG_BIN, FFPROBE_BIN, FRAME_BYTES, DecodeMode,
+                    MediaError, extract_gray_frames, probe_duration)
 
 LOGGER = logging.getLogger(__name__)
 EXACT_KIND = "sha256-v1"
@@ -33,6 +34,7 @@ class ScanOptions:
     duration_seconds: float = 0.5
     refresh: bool = False
     exact_only: bool = False
+    decode_mode: DecodeMode = "auto"
 
 
 def discover(roots: list[Path]) -> tuple[dict[int, list[VideoFile]], int]:
@@ -78,6 +80,7 @@ def full_digest(video: VideoFile, cache: FeatureCache, refresh: bool) -> tuple[b
 
 def visual_feature(
     video: VideoFile, cache: FeatureCache, samples: int, refresh: bool,
+    decode_mode: DecodeMode = "auto",
 ) -> tuple[VisualFeature, bool]:
     kind = f"gray32-bicubic-display-v1:{samples}"
     video.verify()
@@ -87,7 +90,7 @@ def visual_feature(
         if duration is not None and len(data) == samples * FRAME_BYTES:
             return VisualFeature.build(video, duration, data), True
     duration = probe_duration(video.path)
-    data = extract_gray_frames(video.path, duration, samples)
+    data = extract_gray_frames(video.path, duration, samples, decode_mode)
     video.verify()
     cache.put(video, kind, data, duration)
     return VisualFeature.build(video, duration, data), False
@@ -129,7 +132,7 @@ def scan(args: ScanOptions, cache: FeatureCache, report: Callable[[dict], None] 
             (video for group in files_by_size.values() for video in group), start=1,
         ):
             try:
-                feature, hit = visual_feature(video, cache, args.samples, args.refresh)
+                feature, hit = visual_feature(video, cache, args.samples, args.refresh, args.decode_mode)
                 visual_hits += hit
                 if sum(feature.usable) >= (args.samples + 1) // 2:
                     features.append(feature)
@@ -184,6 +187,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cache", type=Path, default=default_cache(), help="本地 SQLite 缓存路径")
     parser.add_argument("--refresh", action="store_true", help="本次扫描重新计算特征")
     parser.add_argument("--exact-only", action="store_true", help="仅查找 SHA-256 相同的文件")
+    parser.add_argument("--decode", choices=("auto", "cpu"), default="auto",
+                        help="抽帧解码模式。auto 自动选择硬件解码并回退到 CPU，cpu 仅用 CPU")
     args = parser.parse_args(argv)
     if not 1 <= args.samples <= 64:
         parser.error("--samples 必须在 1 到 64 之间")
@@ -212,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
         with closing(sqlite3.connect(args.cache, timeout=10)) as db:
             options = ScanOptions(
                 args.roots, args.samples, args.threshold, args.duration_ratio,
-                args.duration_seconds, args.refresh, args.exact_only,
+                args.duration_seconds, args.refresh, args.exact_only, decode_mode=args.decode,
             )
             return scan(options, FeatureCache(db))
     except (OSError, sqlite3.Error) as exc:

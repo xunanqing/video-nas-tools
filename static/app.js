@@ -159,7 +159,10 @@ async function startDedup(event) {
   results.replaceChildren();
   try {
     const request = { path: dedupFolder.path, exact_only: $("dedupExactOnly").checked };
-    if (!request.exact_only) request.threshold = $("dedupThreshold").valueAsNumber / 100;
+    if (!request.exact_only) {
+      request.threshold = $("dedupThreshold").valueAsNumber / 100;
+      request.decode_mode = $("dedupDecodeMode").value;
+    }
     const { summary, matches } = await api("/api/dedup/scan", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -924,6 +927,7 @@ $("dedupCloseBtn").addEventListener("click", () => $("dedupDialog").close());
 $("dedupForm").addEventListener("submit", startDedup);
 $("dedupExactOnly").addEventListener("change", (e) => {
   $("dedupThreshold").disabled = e.target.checked;
+  $("dedupDecodeMode").disabled = e.target.checked;
 });
 $("playRangeBtn").addEventListener("click", playRange);
 function updatePreviewToggleBtn() {

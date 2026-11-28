@@ -73,7 +73,7 @@ set FFPROBE_PATH=C:\tools\ffmpeg\bin\ffprobe.exe
 
 ## 视频查重
 
-在文件列表工具栏点击「视频查重」，可对当前目录及子目录执行只读扫描。窗口显示完全相同的文件组、内容相似的文件对和读取失败计数。独立 CLI 支持扫描多个目录、输出 JSON Lines。两种入口都使用 SHA-256 和灰度抽帧，SQLite 缓存在运行机本地，可用 `VIDEO_NAS_DEDUP_CACHE` 指定本地数据库文件。
+在左侧「显示／隐藏预览」同一行点击「视频查重」，可对当前目录及子目录执行只读扫描。窗口显示完全相同的文件组、内容相似的文件对和读取失败计数。独立 CLI 支持扫描多个目录、输出 JSON Lines。两种入口都使用 SHA-256 和灰度抽帧，SQLite 缓存在运行机本地，可用 `VIDEO_NAS_DEDUP_CACHE` 指定本地数据库文件。
 
 ```bat
 dedup.bat "D:\dedup-test" "\\fnos\media\dedup-test" --threshold 0.96 > "%TEMP%\dedup-results.jsonl"
@@ -81,6 +81,8 @@ python -m unittest discover -s tests -v
 ```
 
 将示例目录换成实际的测试目录。其他平台用 `python -m app.dedup.cli` 代替 `dedup.bat`。视觉模式需要 FFmpeg 与 FFprobe，`--exact-only` 可只运行字节查重。源码分析、缓存参数和 Windows／SMB 验收见[视频查重源码调研与实施计划](docs/video-dedup.md)。
+
+抽帧默认由 FFmpeg 优先使用运行机可用的硬件解码。设备、驱动或视频不支持时会回退到 CPU。可在 Web 的「解码」选择「仅 CPU」，或给 CLI 加 `--decode cpu`。灰度缩放、相似度计算和 SHA-256 仍使用 CPU。已有特征会复用，用 CLI 的 `--refresh` 可强制重新抽帧。
 
 ## NAS 路径
 

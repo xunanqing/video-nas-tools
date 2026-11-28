@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Video NAS Tools</title>
-<link rel="stylesheet" href="/static/style.css?v=20261127g">
+<link rel="stylesheet" href="/static/style.css?v=20261128b">
 </head>
 <body>
 <header>
@@ -20,6 +20,7 @@
   <aside id="sidebar">
     <div class="sidebar-head">
       <div class="sidebar-tools">
+        <button id="dedupBtn" class="btn ghost sm" type="button" aria-haspopup="dialog">视频查重</button>
         <button id="previewToggleBtn" class="btn ghost sm" title="显示/隐藏视频预览">🎬 隐藏预览</button>
       </div>
       <div id="dirList" class="dir-list"></div>
@@ -37,7 +38,6 @@
           <option value="size-asc">最小优先</option>
         </select>
         <span id="fileCount" class="file-count">文件 0</span>
-        <button id="dedupBtn" class="btn ghost sm" type="button" aria-haspopup="dialog">视频查重</button>
         <button id="clearCheckBtn" class="btn ghost sm" title="取消当前所有勾选">☒ 取消勾选</button>
         <button id="selectAllBtn" class="btn ghost sm" title="勾选/取消勾选全部视频文件">☑ 全选</button>
       </div>
@@ -221,6 +221,12 @@
     <label>最低相似度
       <input id="dedupThreshold" type="number" min="0" max="100" step="0.1" value="96" required> %
     </label>
+    <label>解码
+      <select id="dedupDecodeMode">
+        <option value="auto" selected>自动（GPU 优先）</option>
+        <option value="cpu">仅 CPU</option>
+      </select>
+    </label>
     <label><input id="dedupExactOnly" type="checkbox"> 仅查找完全相同的文件</label>
     <button id="dedupScanBtn" class="btn primary" type="submit">开始扫描</button>
   </form>
@@ -242,6 +248,6 @@
 </div>
 
 <div id="toast" class="toast"></div>
-<script src="/static/app.js?v=20261127g"></script>
+<script src="/static/app.js?v=20261128b"></script>
 </body>
 </html>

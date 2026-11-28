@@ -6,10 +6,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from app.dedup.cache import VideoFile
 from app.dedup.matching import VisualFeature, compare, duration_candidates
-from app.dedup.media import FFMPEG_BIN, FFPROBE_BIN, FRAME_BYTES, sample_times
+from app.dedup.media import FFMPEG_BIN, FFPROBE_BIN, FRAME_BYTES, extract_gray_frames, sample_times
 
 
 class MatchingTests(unittest.TestCase):
@@ -34,6 +35,34 @@ class MatchingTests(unittest.TestCase):
         longer = self.feature(11.05, 100)
         matches = list(duration_candidates([at_boundary, shorter, longer], 0.1, 0.25))
         self.assertEqual(matches, [(shorter, at_boundary), (at_boundary, longer)])
+
+
+class DecodeTests(unittest.TestCase):
+    def test_auto_is_tried_before_software(self):
+        frame = b"\x64" * FRAME_BYTES
+        with patch("app.dedup.media.run_tool", return_value=frame) as run:
+            self.assertEqual(extract_gray_frames(Path("video.mp4"), 6, 2), frame * 2)
+        self.assertEqual(self.decode_flags(run), ["auto", "auto"])
+
+    def test_incomplete_auto_result_restarts_all_samples_on_cpu(self):
+        first_auto = b"\x64" * FRAME_BYTES
+        cpu = b"\x80" * FRAME_BYTES
+        with patch("app.dedup.media.run_tool", side_effect=[first_auto, b"", cpu, cpu]) as run:
+            self.assertEqual(extract_gray_frames(Path("video.mp4"), 6, 2), cpu * 2)
+        self.assertEqual(self.decode_flags(run), ["auto", "auto", "none", "none"])
+        sample_positions = [call.args[1][call.args[1].index("-ss") + 1] for call in run.call_args_list]
+        self.assertEqual(sample_positions[:2], sample_positions[2:])
+
+    def test_cpu_mode_never_requests_hardware(self):
+        frame = b"\x64" * FRAME_BYTES
+        with patch("app.dedup.media.run_tool", return_value=frame) as run:
+            self.assertEqual(extract_gray_frames(Path("video.mp4"), 6, 1, "cpu"), frame)
+        self.assertEqual(self.decode_flags(run), ["none"])
+
+    @staticmethod
+    def decode_flags(run):
+        commands = [call.args[1] for call in run.call_args_list]
+        return [command[command.index("-hwaccel:V:0") + 1] for command in commands]
 
 
 class ScanTests(unittest.TestCase):
@@ -108,6 +137,9 @@ class ScanTests(unittest.TestCase):
         warm = self.run_scan(expected_exit=1)
         self.assertEqual(warm[-1]["visual_cache_hits"], 4)
         self.assertEqual(warm[:-1], rows[:-1])
+        cpu = self.run_scan("--decode", "cpu", "--refresh", expected_exit=1)
+        self.assertEqual(cpu[-1]["visual_pairs"], 2)
+        self.assertEqual(cpu[-1]["visual_cache_hits"], 0)
         self.assertEqual(self.run_scan("--samples", "3", expected_exit=1)[-1]["visual_cache_hits"], 0)
         self.assertEqual({path: path.read_bytes() for path in originals}, originals)
 

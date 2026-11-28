@@ -5,12 +5,14 @@ from pathlib import Path
 
 from .cache import FeatureCache
 from .cli import ScanOptions, default_cache, scan
-from .media import FFMPEG_BIN, FFPROBE_BIN
+from .media import DecodeMode, FFMPEG_BIN, FFPROBE_BIN
 
 DISPLAY_LIMIT = 200
 
 
-def scan_folder(path: Path, threshold: float, exact_only: bool) -> dict:
+def scan_folder(
+    path: Path, threshold: float, exact_only: bool, decode_mode: DecodeMode = "auto",
+) -> dict:
     if not exact_only and not all(shutil.which(binary) for binary in (FFMPEG_BIN, FFPROBE_BIN)):
         raise FileNotFoundError("内容查重需要 FFmpeg 和 FFprobe，也可以选择仅查找相同文件")
 
@@ -31,7 +33,8 @@ def scan_folder(path: Path, threshold: float, exact_only: bool) -> dict:
     cache_path = default_cache()
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(cache_path, timeout=10)) as db:
-        scan(ScanOptions([path], threshold=threshold, exact_only=exact_only), FeatureCache(db), collect)
+        options = ScanOptions([path], threshold=threshold, exact_only=exact_only, decode_mode=decode_mode)
+        scan(options, FeatureCache(db), collect)
     return {"summary": summary, "matches": matches}
 
 
