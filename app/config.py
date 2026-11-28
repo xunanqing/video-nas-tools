@@ -6,7 +6,8 @@ import tempfile
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-SETTINGS_FILE = BASE_DIR / "settings.json"
+DATA_DIR = Path(os.environ.get("VIDEO_NAS_DATA_DIR") or BASE_DIR)
+SETTINGS_FILE = DATA_DIR / "settings.json"
 
 VIDEO_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".m2ts", ".mts",
@@ -22,7 +23,7 @@ MIME_MAP = {
     ".3gp": "video/3gpp", ".vob": "video/dvd", ".ogv": "video/ogg",
 }
 
-DEFAULT_ROOT = BASE_DIR / "videos"
+DEFAULT_ROOT = Path(os.environ.get("VIDEO_NAS_MEDIA_ROOT") or BASE_DIR / "videos")
 DEFAULT_PREFERENCES = {
     "ffmpeg_dir": "",
     "dedup_threshold": 0.96,
@@ -48,6 +49,7 @@ def load_settings() -> dict:
 
 
 def save_settings(data: dict) -> None:
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile(

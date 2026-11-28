@@ -16,6 +16,7 @@
 | --- | --- |
 | `run.py` | 启动入口：`uvicorn.run("app.main:app", host="127.0.0.1", port=8899, reload=False)` |
 | `requirements.txt` | Python 依赖：fastapi、uvicorn、send2trash |
+| `Dockerfile`、`compose.yaml`、`.env.example` | Docker 构建、数据挂载及飞牛 NAS 部署配置 |
 | `app/config.py` | 根目录配置读写、ffmpeg 路径、视频扩展名与 MIME 映射 |
 | `app/ffmpeg_service.py` | ffmpeg/ffprobe 封装：探测、截取、旋转、拼接的参数构建与执行 |
 | `app/task_queue.py` | 异步任务队列（2 并发）、Task 数据模型、进度与状态 |
@@ -44,6 +45,7 @@ python run.py
 - Web 顶栏「配置」可保存 FFmpeg 和 FFprobe 所在的本地目录，Web 与查重 CLI 共用。留空时按 `FFMPEG_PATH` / `FFPROBE_PATH`、PATH 的顺序查找。
 - 原生目录选择在服务端桌面打开。Windows 用 PowerShell／Windows Forms，macOS 用系统自带的 `osascript`。Linux／NAS 无桌面环境时手填服务端挂载目录，容器内使用容器挂载路径。
 - 服务绑定 `127.0.0.1`，**无用户认证**，不要暴露到公网。
+- 容器内监听 `0.0.0.0:8899`，Compose 宿主端口默认只绑定回环地址，可改成 NAS 局域网 IP。视频默认只读挂载到 `/media/videos`，持久数据挂载到 `/data`。详见 [飞牛 NAS 部署指南](README.md#飞牛-nasfnosdocker-部署)。
 
 ## 4. API 清单
 

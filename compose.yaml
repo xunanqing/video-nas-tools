@@ -1,0 +1,26 @@
+name: video-nas-tools
+services:
+  video-nas-tools:
+    image: "${VIDEO_NAS_IMAGE:-video-nas-tools:local}"
+    build:
+      context: .
+    user: "${NAS_UID:-1000}:${NAS_GID:-1000}"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    ports:
+      - "${NAS_BIND_IP:-127.0.0.1}:${NAS_PORT:-8899}:8899"
+    volumes:
+      - type: bind
+        source: "${NAS_MEDIA_DIR:?请设置 NAS_MEDIA_DIR}"
+        target: /media/videos
+        read_only: ${NAS_MEDIA_READ_ONLY:-true}
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${NAS_DATA_DIR:?请设置 NAS_DATA_DIR}"
+        target: /data
+        bind:
+          create_host_path: false

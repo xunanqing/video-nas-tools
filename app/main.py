@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from . import ffmpeg_service as ff
 from . import tag_store
-from .config import (BASE_DIR, MIME_MAP, VIDEO_EXTS, get_preferences,
+from .config import (BASE_DIR, DATA_DIR, MIME_MAP, VIDEO_EXTS, get_preferences,
                      get_root, load_settings, media_tools, save_settings, set_ffmpeg_dir,
                      set_root, validate_ffmpeg_dir, validate_local_directory)
 from .dedup.media import DecodeMode
@@ -38,8 +38,8 @@ picker_lock = asyncio.Lock()
 CHUNK_SIZE = 1024 * 1024
 LOGGER = logging.getLogger(__name__)
 
-STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
-THUMB_DIR = Path(__file__).resolve().parent.parent / ".thumbnails"
+STATIC_DIR = BASE_DIR / "static"
+THUMB_DIR = DATA_DIR / ".thumbnails"
 THUMB_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -771,7 +771,7 @@ async def delete_tag(req: TagDeleteReq):
 
 # ---------- 智能检测（黑帧 / 静音 / 场景切换） ----------
 
-DETECT_FILE = BASE_DIR / ".workbuddy" / "detections.json"
+DETECT_FILE = DATA_DIR / ".workbuddy" / "detections.json"
 
 
 def _detections_load() -> dict:

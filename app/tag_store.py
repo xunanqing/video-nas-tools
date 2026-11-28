@@ -12,9 +12,9 @@ import time
 from pathlib import Path
 from threading import RLock
 
-from .config import BASE_DIR
+from .config import DATA_DIR
 
-TAGS_FILE = BASE_DIR / ".workbuddy" / "tags.json"
+TAGS_FILE = DATA_DIR / ".workbuddy" / "tags.json"
 _lock = RLock()
 
 VALID_SOURCES = {"manual", "auto", "detected", "imported"}

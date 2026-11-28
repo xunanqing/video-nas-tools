@@ -95,14 +95,78 @@ python -m unittest discover -s tests -v
 
 抽帧默认由 FFmpeg 优先使用运行机可用的硬件解码。设备、驱动或视频不支持时会回退到 CPU。可在 Web 的「解码」选择「仅 CPU」，或给 CLI 加 `--decode cpu`。灰度缩放、相似度计算和 SHA-256 仍使用 CPU。已有特征会复用，用 CLI 的 `--refresh` 可强制重新抽帧。
 
-## NAS 路径
+## 飞牛 NAS（fnOS）Docker 部署
 
-程序在 NAS 上运行时，填写 NAS 服务进程能访问的路径。使用容器时，先把共享目录挂载到容器，例如 `/media/videos`，再将该容器内路径保存为根目录。若程序运行在 Mac 且已通过 Finder 挂载 SMB 共享，可在「浏览」对话框选择相应卷，也可手填 `/Volumes/共享名`。
+### 准备目录
+
+把项目源码放到 NAS 上的一个独立目录，并准备视频目录和应用数据目录。数据目录放在 NAS 本地存储上，与视频目录分开。用 `id` 查看运行用户的 UID 和 GID，确保这个用户能读取视频、进入视频目录，并能写入数据目录。
+
+```bash
+cp .env.example .env
+```
+
+根据 NAS 的实际配置编辑 `.env`。
+
+| 配置 | 填写方式 |
+| --- | --- |
+| `NAS_MEDIA_DIR` | 视频目录在 NAS 上的绝对路径，容器内对应 `/media/videos` |
+| `NAS_DATA_DIR` | 已存在的应用数据目录绝对路径，容器内对应 `/data` |
+| `NAS_UID` / `NAS_GID` | 拥有以上权限的用户和用户组的数字 ID |
+| `NAS_BIND_IP` | 从其他电脑访问时填 NAS 的局域网 IP |
+| `NAS_PORT` | NAS 对外的应用端口，默认 `8899` |
+| `NAS_MEDIA_READ_ONLY` | 初次使用保留 `true`。要旋转、重命名、修改元数据或清理文件时改成 `false` |
+
+应用没有登录认证。只在可信局域网内开放端口，避免设置公网转发。
+
+### 构建和启动
+
+在飞牛安装并启用 Docker，SSH 登录 NAS 后进入项目根目录，运行以下命令。飞牛 Docker 界面可查看生成的项目、容器状态和日志。
+
+```bash
+docker compose config --quiet
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=50
+```
+
+容器显示 `healthy` 后，在同一局域网的电脑访问 `http://NAS局域网IP:8899`。项目默认打开 `/media/videos`。如需切换浏览目录，在「输入路径」中填写容器路径，例如 `/media/videos/测试`。
+
+FFmpeg 和 FFprobe 已随镜像安装，顶栏「配置」中的 FFmpeg 目录留空即可。当前 Compose 适用于 CPU 模式，自动解码会在没有可用硬件设备时使用软件解码。
+
+只读挂载下也可以截取和拼接。先在 NAS 的应用数据目录下创建 `outputs`，并在「配置」里将输出目录设为 `/data/outputs`。生成文件可从 NAS 的应用数据目录中查看。启用可写媒体挂载后，先用可丢弃的副本确认权限和各操作。Linux 容器的回收站取决于文件系统和挂载权限，应用会报告失败。用测试副本验证恢复位置后再清理实际素材。
+
+### 更新和持久化
+
+更新源码后，在同一项目目录再次运行 `docker compose up -d --build`。若只修改了 `.env`，运行 `docker compose up -d`。
+
+重建容器时，`/data` 中的 `settings.json`、缩略图、标签、检测结果和 SQLite 查重缓存会保留。任务队列和最近一次查重的清理凭证保存在内存里，重建后要重新扫描才能清理。浏览器的视图筛选配置仍由浏览器保存。
+
+如果 NAS 不方便拉取基础镜像或依赖，可以在另一台支持 Docker 的电脑构建并导入。先用 `uname -m` 确认 NAS 的架构，下面以 `x86_64` 为例：
+
+```bash
+# 构建机，在源码根目录运行
+docker build --platform linux/amd64 -t video-nas-tools:local .
+docker save -o video-nas-tools.tar video-nas-tools:local
+
+# 将镜像文件、compose.yaml 和编辑好的 .env 传到 NAS 后运行
+docker load -i video-nas-tools.tar
+docker compose up -d --no-build --pull never
+```
+
+### 部署验收
+
+使用一个单独的测试目录，放入两个相同的小视频。检查文件列表、缩略图、播放和完全相同文件查重。保存一个设置后用 `docker compose up -d --force-recreate` 重建容器，检查设置与查重缓存仍在。只读模式下保留两个原测试文件。
+
+2026-11-28 在 macOS 使用 Compose 2.39.4 校验了只读和可写配置，以及带中文和空格的宿主路径。隔离的本机服务通过了合成视频的列表、缩略图、Range 播放和查重验证，重启后仍能读取设置、标签和 SQLite 缓存。实际镜像构建、fnOS 启动和回收站行为待在有 Docker 引擎的环境验收。
+
+### Mac 访问 NAS 共享目录
+
+若程序运行在 Mac 且已通过 Finder 挂载 SMB 共享，可在「浏览」对话框选择相应卷，也可手填 `/Volumes/共享名`。
 
 ## 注意事项
 
-- 服务绑定 `127.0.0.1` 且没有用户认证，**请勿暴露到公网**。
-- 删除操作会把文件移入回收站，仍可从回收站恢复。
+- 本机启动绑定 `127.0.0.1`。Docker 可绑定 NAS 的局域网 IP。应用没有用户认证，**请勿暴露到公网**。
+- 删除操作使用系统回收站。容器内的回收站受挂载方式和文件权限影响，失败时应用会报告错误。
 - 旋转会替换原文件（文件名和修改时间保持不变），建议对重要素材提前备份。
 - 拼接生成新文件，不会修改或删除原视频。
 - 任务队列保存在内存中，服务重启后任务记录会清空。
